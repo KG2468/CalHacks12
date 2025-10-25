@@ -20,7 +20,7 @@ except ImportError:
 # We move these into a 'config' dict for W&B
 CONFIG = {
     "vocab_size": 50257,  # CRITICAL: This is the vocab size for EleutherAI/gpt-neo-125M
-    "block_size": 256,
+    "block_size": 4096,
     "n_layer": 6,
     "n_head": 8,
     "n_embd": 512,

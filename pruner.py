@@ -350,7 +350,7 @@ if __name__ == "__main__":
     # To get the "intersection of prune-ables", set k = N_methods
     # This prunes a weight ONLY if ALL methods agree it's unimportant.
     pruner_int.prune_consensus(
-        methods=['magnitude', 'gradient'],
+        methods=['random'],
         sparsity_per_method=0.5, # Each method identifies its bottom 50%
         consensus_k=2,             # Prune ONLY if 2/2 methods agree
         data_batch=(dummy_inputs, dummy_labels),
