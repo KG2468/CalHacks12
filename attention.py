@@ -24,14 +24,43 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, n_embd, n_head, attn_dropout=0.1):
         super().__init__()
         assert n_embd % n_head == 0
+
+        self.n_head = n_head
+        self.head_dim = n_embd // n_head
+        self.n_embd = n_embd
+
+        self.c_attn = nn.Linear(n_embd, 3 * n_embd)
         self.mha = nn.MultiheadAttention(embed_dim=n_embd, num_heads=n_head, dropout=attn_dropout, batch_first=True)
         self.proj_dropout = nn.Dropout(attn_dropout)
+        self.proj_dropout = nn.Dropout(attn_dropout)
 
-    def forward(self, x, attn_mask=None):
-        # x: (B, T, E)
-        # attn_mask should be shape (T, T) with -inf where masked (causal)
-        attn_out, _ = self.mha(x, x, x, attn_mask=attn_mask, need_weights=False)
-        return self.proj_dropout(attn_out)
+    def forward(self, x, kv_cache=None, attn_mask=None):
+        B, T, C = x.shape
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+
+        if kv_cache is not None:
+            past_key, past_value = kv_cache
+            k = torch.cat((past_key, k), dim=2)
+            v = torch.cat((past_value, v), dim=2)
+
+        new_kv_cache = (k.detach(), v.detach())
+
+        attn_output = F.scaled_dot_product_attention(
+            q, k, v, 
+            attn_mask=attn_mask, 
+            dropout_p=self.attn_dropout.p if self.training else 0.0,
+            is_causal=False
+        )
+        
+        attn_output = attn_output.transpose(1, 2).contiguous().view(B, T, C)
+        attn_output = self.c_proj(attn_output)
+        attn_output = self.proj_dropout(attn_output)
+        
+        return attn_output, new_kv_cache
 
 
 class TransformerBlock(nn.Module):
@@ -43,10 +72,11 @@ class TransformerBlock(nn.Module):
         self.ln2 = nn.LayerNorm(n_embd)
         self.ff = FeedForward(n_embd, ff_hidden, dropout)
 
-    def forward(self, x, attn_mask=None):
-        x = x + self.attn(self.ln1(x), attn_mask=attn_mask)
+    def forward(self, x, kv_cache=None, attn_mask=None):
+        attn_output, new_kv_cache = self.attn(self.ln1(x), kv_cache=kv_cache, attn_mask=attn_mask)
+        x = x + attn_output
         x = x + self.ff(self.ln2(x))
-        return x
+        return x, new_kv_cache
 
 
 class SimpleAttentionLM(nn.Module):
