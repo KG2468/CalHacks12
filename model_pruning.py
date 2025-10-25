@@ -182,10 +182,11 @@ class ModelPruner:
                 grad = gradients[param_name]
                 grad_magnitude = torch.abs(grad)
                 
-                # Calculate threshold
+                # Calculate threshold - prune weights with smallest gradient magnitudes
+                # (keep weights with larger gradients as they're more important)
                 threshold = torch.quantile(grad_magnitude.flatten(), amount)
                 
-                # Create mask
+                # Create mask - keep weights with gradient magnitude above threshold
                 mask = (grad_magnitude > threshold).float()
                 
                 # Apply mask

@@ -233,7 +233,6 @@ def demo_quantization():
         print("Quantized models typically achieve 2-4x compression")
 
 
-
 def demo_combined_pruning_and_quantization():
     """Demonstrate combining pruning and quantization."""
     print_separator("Combined Pruning + Quantization Demo")
