@@ -15,6 +15,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 # --------------------
 
+os.environ["WANDB_START_METHOD"] = "thread"
+os.environ["WANDB_MODE"] = "online"       # ensure online sync
+os.environ["WANDB_CONSOLE"] = "off"       # prevent stdout blocking
+
 # --- Import your model ---
 try:
     from attention import SimpleAttentionLM
