@@ -173,6 +173,12 @@ if __name__ == "__main__":
             config=CONFIG
         )
         print(f"W&B Run: {wandb.run.name}")
+    
+    if rank == 0:
+        print("Testing W&B log right after init...", flush=True)
+        wandb.log({"sanity_loss": 123})
+        wandb.flush()
+        time.sleep(5)
     # ----------------------------------
 
     DATA_FILE = "train_dataset.bin"
@@ -327,6 +333,28 @@ if __name__ == "__main__":
         epoch_time = time.time() - epoch_start_time
         if rank == 0:
             print(f"Epoch {epoch+1} finished in {epoch_time:.2f}s")
+
+            # --- Save model checkpoint every epoch ---
+            ckpt_dir = "checkpoints"
+            os.makedirs(ckpt_dir, exist_ok=True)
+            ckpt_path = os.path.join(ckpt_dir, f"model_epoch_{epoch+1}.pt")
+
+            save_model = model.module if is_ddp else model
+            torch.save(save_model.state_dict(), ckpt_path)
+            print(f"[Checkpoint] Saved model checkpoint -> {ckpt_path}")
+
+            # Optionally sync with W&B
+            wandb.save(ckpt_path)
+
+            # Optional: limit number of checkpoints to keep (e.g., last 3)
+            # MAX_CHECKPOINTS = 3
+            # ckpts = sorted(
+            #     [f for f in os.listdir(ckpt_dir) if f.startswith("model_epoch_")]
+            # )
+            # if len(ckpts) > MAX_CHECKPOINTS:
+            #     old_ckpt = os.path.join(ckpt_dir, ckpts[0])
+            #     os.remove(old_ckpt)
+            #     print(f"[Checkpoint] Deleted old checkpoint -> {old_ckpt}")
 
     if rank == 0: print("Training finished.")
 
