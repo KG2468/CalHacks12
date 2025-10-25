@@ -37,23 +37,65 @@ CONFIG = {
 
 # --- 2. Data Pipeline (MmapDataset) ---
 # (This class is unchanged)
+# --- 2. Data Pipeline (MmapDataset) ---
+# (This class is UNCHANGED... except it is replaced by this new one)
 class MmapDataset(Dataset):
-    def __init__(self, bin_file_path, block_size, dtype=np.uint16):
+    def __init__(self, bin_file_path, block_size, dtype=np.uint16, offset_tokens=0, max_tokens=None):
+        """
+        MmapDataset
+        :param bin_file_path: Path to the .bin file
+        :param block_size: Sequence length
+        :param dtype: Numpy dtype of the tokens (e.g., np.uint16)
+        :param offset_tokens: (NEW) Number of tokens to *skip* from the start of the file
+        :param max_tokens: (NEW) Maximum number of tokens to load *after* the offset.
+                           If None, loads all tokens from the offset to the end.
+        """
         super().__init__()
         self.block_size = block_size
         self.dtype = dtype
-        file_size_bytes = os.path.getsize(bin_file_path)
         item_size = np.dtype(self.dtype).itemsize
+
+        file_size_bytes = os.path.getsize(bin_file_path)
+        total_tokens_in_file = file_size_bytes // item_size
+
         if file_size_bytes % item_size != 0:
             raise ValueError("File size is not a multiple of item size!")
-        self.num_tokens = file_size_bytes // item_size
-        print(f"Memory-mapping {bin_file_path} ({self.num_tokens:,} tokens)")
-        self.mmap = np.memmap(bin_file_path, dtype=self.dtype, mode='r')
+        
+        # Calculate the number of tokens to use
+        if max_tokens is None:
+            # Use all tokens from the offset to the end
+            self.num_tokens = total_tokens_in_file - offset_tokens
+        else:
+            # Use 'max_tokens', but don't go past the end of the file
+            self.num_tokens = min(max_tokens, total_tokens_in_file - offset_tokens)
+
+        # Calculate the byte offset
+        byte_offset = offset_tokens * item_size
+        
+        # Define the shape of the mmap array
+        mmap_shape = (self.num_tokens,)
+
+        print(f"Memory-mapping {bin_file_path}...")
+        print(f"  - Using {self.num_tokens:,} tokens")
+        print(f"  - Starting from token {offset_tokens:,} (byte offset {byte_offset:,})")
+
+        self.mmap = np.memmap(
+            bin_file_path, 
+            dtype=self.dtype, 
+            mode='r',
+            offset=byte_offset, # <-- Use the byte offset
+            shape=mmap_shape    # <-- Use the specific shape
+        )
+        
+        if self.num_tokens < block_size + 1:
+            raise ValueError(f"Dataset partition is too small ({self.num_tokens} tokens) for block_size ({block_size}).")
 
     def __len__(self):
+        # The number of *sequences* we can make
         return self.num_tokens - self.block_size - 1
 
     def __getitem__(self, idx):
+        # This logic remains the same
         chunk = self.mmap[idx : idx + self.block_size + 1]
         x = torch.from_numpy(chunk[:-1].astype(np.int64))
         y = torch.from_numpy(chunk[1:].astype(np.int64))
@@ -107,19 +149,66 @@ if __name__ == "__main__":
     
     # --- Init Data ---
     print("Loading data...")
-    full_dataset = MmapDataset(DATA_FILE, CONFIG['block_size'], dtype=np.uint16)
+
+    # --- THIS IS THE CHANGE YOU REQUESTED ---
+    TOKENS_PART_1 = 476616445 
     
-    n = len(full_dataset)
-    train_n = int(n * 0.9)
-    val_n = n - train_n
-    train_data, val_data = torch.utils.data.random_split(
-        full_dataset, 
-        [train_n, val_n],
-        generator=torch.Generator().manual_seed(42)
+    # Load *only* the first part of the dataset
+    print("Loading Dataset Part 1...")
+    dataset_part_1 = MmapDataset(
+        DATA_FILE, 
+        CONFIG['block_size'], 
+        dtype=np.uint16,
+        offset_tokens=0,           # Start from the beginning
+        max_tokens=TOKENS_PART_1   # Load only this many tokens
     )
     
-    print(f"Total sequences: {n:,}")
-    print(f"Train sequences: {len(train_data):,}, Val sequences: {len(val_data):,}")
+    # (Optional) To load the *second* part later (e.g., for another training run),
+    # you would just change the parameters like this:
+    # print("Loading Dataset Part 2...")
+    # dataset_part_2 = MmapDataset(
+    #     DATA_FILE, 
+    #     CONFIG['block_size'], 
+    #     dtype=np.uint16,
+    #     offset_tokens=TOKENS_PART_1, # Start *after* part 1
+    #     max_tokens=None              # Load all remaining tokens
+    # )
+    # --- End of change ---
+
+    
+    # Now, we split dataset_part_1 into train/val
+    # The rest of the script will *only* train on this first part.
+    n = len(dataset_part_1) 
+    train_n = int(n * 0.9)
+    val_n = n - train_n
+    
+    # Handle the case where the validation set is empty
+    if val_n == 0:
+        print("Warning: Validation split is 0. Using entire partition for training.")
+        train_n = n
+        train_data = dataset_part_1
+        # Create a dummy val_data to avoid errors, though it won't be used meaningfully
+        # Or, better, adjust the evaluation logic
+        # For simplicity, we'll just split 90/10 even if val_n is tiny
+        if n > 10: # Ensure we have enough data to split
+            train_n = int(n * 0.9)
+            val_n = n - train_n
+        else:
+            train_n = n
+            val_n = 0 # No validation
+            
+    if val_n > 0:
+        train_data, val_data = torch.utils.data.random_split(
+            dataset_part_1, # <-- Use the partial dataset
+            [train_n, val_n],
+            generator=torch.Generator().manual_seed(42)
+        )
+    else:
+        train_data = dataset_part_1
+        val_data = None # Handle this in your eval loop
+    
+    print(f"Total sequences (from Part 1): {n:,}")
+    print(f"Train sequences: {len(train_data):,}, Val sequences: {len(val_data) if val_data else 0:,}")
     
     train_loader = DataLoader(
         train_data, 
@@ -128,12 +217,16 @@ if __name__ == "__main__":
         pin_memory=True, 
         num_workers=4 if CONFIG['device'] == 'cuda' else 0
     )
-    val_loader = DataLoader(
-        val_data, 
-        batch_size=CONFIG['batch_size'], 
-        pin_memory=True, 
-        num_workers=4 if CONFIG['device'] == 'cuda' else 0
-    )
+    
+    # Only create a val_loader if val_data exists
+    val_loader = None
+    if val_data:
+        val_loader = DataLoader(
+            val_data, 
+            batch_size=CONFIG['batch_size'], 
+            pin_memory=True, 
+            num_workers=4 if CONFIG['device'] == 'cuda' else 0
+        )
 
     # --- Init Model ---
     print("Initializing model...")
