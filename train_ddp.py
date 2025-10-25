@@ -177,7 +177,6 @@ if __name__ == "__main__":
     if rank == 0:
         print("Testing W&B log right after init...", flush=True)
         wandb.log({"sanity_loss": 123})
-        wandb.flush()
         time.sleep(5)
     # ----------------------------------
 
