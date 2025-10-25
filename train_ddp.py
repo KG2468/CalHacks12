@@ -38,7 +38,7 @@ CONFIG = {
     "dropout": 0.1,
     "batch_size": 32, # This will be batch size PER GPU
     "learning_rate": 3e-4,
-    "num_epochs": 1,
+    "num_epochs": 15,
     "eval_interval": 100,
     "log_interval": 10,
     "device": 'cuda', # We'll determine the specific GPU later
