@@ -1,127 +1,172 @@
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
+from torch.optim import AdamW
 from transformers import AutoTokenizer
-from datasets import load_dataset
+# from datasets import load_dataset # <-- No longer needed
 import time
+import numpy as np # <-- Add numpy
+import os # <-- Add os
 
-# --- Import your model ---
-# Make sure your corrected attention.py is in the same directory
-from attention import SimpleAttentionLM 
+# --- Import your model from the other file ---
+# Make sure attention.py is in the same directory
+try:
+    from attention import SimpleAttentionLM
+except ImportError:
+    print("Error: Could not import SimpleAttentionLM from attention.py")
+    print("Please make sure attention.py is in the same directory and is corrected.")
+    exit()
 
 # --- 1. Config ---
-# Model Config
-VOCAB_SIZE = 50257  # GPT-2's vocab size
-BLOCK_SIZE = 256    # Context window
-N_LAYER = 6
-N_HEAD = 8
-N_EMBD = 512
+VOCAB_SIZE = 50257  # CRITICAL: This is the vocab size for EleutherAI/gpt-neo-125M
+BLOCK_SIZE = 256    # Context window size
+N_LAYER = 6         # Number of transformer blocks
+N_HEAD = 8          # Number of attention heads
+N_EMBD = 512        # Embedding dimension
 DROPOUT = 0.1
-
-# Training Config
-BATCH_SIZE = 32
-LEARNING_RATE = 3e-4
-NUM_EPOCHS = 1
-EVAL_INTERVAL = 100
-LOG_INTERVAL = 10
+BATCH_SIZE = 32     # How many sequences to process in parallel
+LEARNING_RATE = 3e-4 # Optimizer learning rate
+NUM_EPOCHS = 1      # How many times to go over the full dataset
+EVAL_INTERVAL = 100 # How often to run evaluation (in steps)
+LOG_INTERVAL = 10   # How often to print training loss (in steps)
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-# --- 2. Data Pipeline ---
+# --- 2. Data Pipeline (NEW) ---
+# We replace TextDataset and get_data_loaders with MmapDataset
 
-class TextDataset(Dataset):
-    """A simple dataset to hold tokenized text."""
-    def __init__(self, token_ids, block_size):
-        self.token_ids = token_ids
+class MmapDataset(Dataset):
+    """
+    A Dataset that memory-maps a large binary file of token IDs.
+    This is very fast and uses almost no RAM.
+    """
+    def __init__(self, bin_file_path, block_size, dtype=np.uint16):
+        super().__init__()
         self.block_size = block_size
+        self.dtype = dtype
+        
+        # Get file size to calculate length
+        file_size_bytes = os.path.getsize(bin_file_path)
+        item_size = np.dtype(self.dtype).itemsize
+        if file_size_bytes % item_size != 0:
+            raise ValueError("File size is not a multiple of item size!")
+            
+        self.num_tokens = file_size_bytes // item_size
+        
+        # Memory-map the file
+        print(f"Memory-mapping {bin_file_path} ({self.num_tokens:,} tokens)")
+        self.mmap = np.memmap(bin_file_path, dtype=self.dtype, mode='r')
 
     def __len__(self):
         # -1 because we need a target for each input
-        return len(self.token_ids) - self.block_size - 1
+        return self.num_tokens - self.block_size - 1
 
     def __getitem__(self, idx):
-        # Grab a chunk of text
-        chunk = self.token_ids[idx : idx + self.block_size + 1]
-        # Input is all but the last token
-        x = torch.tensor(chunk[:-1], dtype=torch.long)
-        # Target is all but the first token (shifted by one)
-        y = torch.tensor(chunk[1:], dtype=torch.long)
+        # Grab a chunk of (block_size + 1) tokens
+        chunk = self.mmap[idx : idx + self.block_size + 1]
+        
+        # Convert numpy slice to torch tensor
+        # .astype(np.int64) is important because torch.long is 64-bit
+        # and CrossEntropyLoss expects long tensors.
+        x = torch.from_numpy(chunk[:-1].astype(np.int64))
+        y = torch.from_numpy(chunk[1:].astype(np.int64))
         return x, y
 
-def get_data_loaders(tokenizer, block_size, batch_size):
-    print("Loading and tokenizing data...")
-    # Load wikitext-103
-    dataset = load_dataset("wikitext", "wikitext-103-v1")
-    
-    # Concatenate all text and tokenize
-    train_text = "\n".join(dataset['train']['text'])
-    val_text = "\n".join(dataset['validation']['text'])
-    
-    train_ids = tokenizer.encode(train_text)
-    val_ids = tokenizer.encode(val_text)
-    
-    print(f"Train tokens: {len(train_ids):,}, Val tokens: {len(val_ids):,}")
-    
-    train_data = TextDataset(train_ids, block_size)
-    val_data = TextDataset(val_ids, block_size)
-    
-    train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True, pin_memory=True, num_workers=4)
-    val_loader = DataLoader(val_data, batch_size=batch_size, pin_memory=True, num_workers=4)
-    
-    return train_loader, val_loader
-
 # --- 3. Training & Evaluation Functions ---
-
 @torch.no_grad()
 def evaluate(model, val_loader, loss_fn):
     """Calculates average validation loss."""
-    model.eval()
+    model.eval() # Set model to evaluation mode
     losses = []
-    for x, y in val_loader:
+    # --- Create a smaller loop for validation ---
+    # We don't want to evaluate the *entire* val split, just a sample
+    val_iter = iter(val_loader)
+    for k in range(100): # Evaluate on 100 batches
+        try:
+            x, y = next(val_iter)
+        except StopIteration:
+            break # Stop if val loader is exhausted
+            
         x, y = x.to(DEVICE), y.to(DEVICE)
-        
-        # We don't need the cache, just the logits
         logits, _ = model(x, past_kv_caches=None)
-        
-        # Calculate loss
-        # logits: (B, T, V) -> (B*T, V)
-        # y: (B, T) -> (B*T)
         loss = loss_fn(logits.view(-1, model.vocab_size), y.view(-1))
         losses.append(loss.item())
         
-    model.train()
+    model.train() # Set model back to training mode
+    if not losses:
+        return 0.0
     return torch.tensor(losses).mean().item()
 
 # --- 4. Main Training Script ---
 
 if __name__ == "__main__":
     print(f"Using device: {DEVICE}")
-
-    # Init tokenizer
-    tokenizer = AutoTokenizer.from_pretrained("gpt2")
     
-    # Init data
-    train_loader, val_loader = get_data_loaders(tokenizer, BLOCK_SIZE, BATCH_SIZE)
+    DATA_FILE = "train_dataset.bin"
+    if not os.path.exists(DATA_FILE):
+        print(f"Error: {DATA_FILE} not found.")
+        print("Please run build_dataset.py first to create the dataset.")
+        exit()
 
-    # Init model
-    model = SimpleAttentionLM(
-        vocab_size=VOCAB_SIZE,
-        block_size=BLOCK_SIZE,
-        n_layer=N_LAYER,
-        n_head=N_HEAD,
-        n_embd=N_EMBD,
-        ff_hidden=N_EMBD * 4,
-        dropout=DROPOUT
-    ).to(DEVICE)
+    # --- Init Tokenizer ---
+    print("Loading 'EleutherAI/gpt-neo-125M' tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
+    
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    
+    # --- Init Data (NEW) ---
+    print("Loading data...")
+    # Create one big MmapDataset
+    full_dataset = MmapDataset(DATA_FILE, BLOCK_SIZE, dtype=np.uint16)
+    
+    # Create a 90/10 train/val split
+    n = len(full_dataset)
+    train_n = int(n * 0.9)
+    val_n = n - train_n
+    train_data, val_data = torch.utils.data.random_split(
+        full_dataset, 
+        [train_n, val_n],
+        generator=torch.Generator().manual_seed(42) # for reproducibility
+    )
+    
+    print(f"Total sequences: {n:,}")
+    print(f"Train sequences: {len(train_data):,}, Val sequences: {len(val_data):,}")
+    
+    train_loader = DataLoader(
+        train_data, 
+        batch_size=BATCH_SIZE, 
+        shuffle=True, 
+        pin_memory=True, 
+        num_workers=4 if DEVICE == 'cuda' else 0
+    )
+    val_loader = DataLoader(
+        val_data, 
+        batch_size=BATCH_SIZE, 
+        pin_memory=True, 
+        num_workers=4 if DEVICE == 'cuda' else 0
+    )
+
+    # --- Init Model ---
+    print("Initializing model...")
+    model_config = {
+        "vocab_size": VOCAB_SIZE,
+        "block_size": BLOCK_SIZE,
+        "n_layer": N_LAYER,
+        "n_head": N_HEAD,
+        "n_embd": N_EMBD,
+        "ff_hidden": N_EMBD * 4,
+        "dropout": DROPOUT
+    }
+    model = SimpleAttentionLM(**model_config).to(DEVICE)
     
     print(f"Model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)/1e6:.2f}M")
 
-    # Init optimizer (AdamW is good for transformers)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
-    
-    # Loss function (ignore padding tokens if you have them, here we don't)
+    # --- Init Optimizer & Loss ---
+    optimizer = AdamW(model.parameters(), lr=LEARNING_RATE)
     loss_fn = nn.CrossEntropyLoss()
 
     # --- Training Loop ---
+    print("Starting training...")
     model.train()
     step = 0
     for epoch in range(NUM_EPOCHS):
@@ -132,33 +177,25 @@ if __name__ == "__main__":
             batch_start_time = time.time()
             x, y = x.to(DEVICE), y.to(DEVICE)
             
-            # --- Forward pass ---
-            # We run in training mode (past_kv_caches=None)
-            # We ignore the returned cache
             logits, _ = model(x, past_kv_caches=None)
-            
-            # --- Calculate loss ---
             loss = loss_fn(logits.view(-1, model.vocab_size), y.view(-1))
             
-            # --- Backward pass & optimization ---
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
             
             step += 1
             
-            # --- Logging ---
             if step % LOG_INTERVAL == 0:
                 batch_time = (time.time() - batch_start_time) * 1000 # in ms
                 print(f"Step {step} | Loss: {loss.item():.4f} | Time: {batch_time:.2f}ms")
             
-            # --- Evaluation ---
-            if step % EVAL_INTERVAL == 0:
+            if step % EVAL_INTERVAL == 0 and step > 0:
                 val_loss = evaluate(model, val_loader, loss_fn)
                 print(f"--- Validation ---")
                 print(f"Step {step} | Val Loss: {val_loss:.4f}")
                 print(f"--------------------")
-                model.train() # Set back to train mode
+                model.train()
 
         epoch_time = time.time() - epoch_start_time
         print(f"Epoch {epoch+1} finished in {epoch_time:.2f}s")
@@ -166,14 +203,16 @@ if __name__ == "__main__":
     print("Training finished.")
     
     # --- Save the model ---
-    torch.save(model.state_dict(), "simple_lm_pretrained.pt")
-    print("Model saved to simple_lm_pretrained.pt")
+    model_save_path = "simple_lm_custom_dataset.pt"
+    torch.save(model.state_dict(), model_save_path)
+    print(f"Model saved to {model_save_path}")
     
     # --- Test Generation ---
     print("\n--- Testing Generation ---")
-    model.load_state_dict(torch.load("simple_lm_pretrained.pt"))
+    model.load_state_dict(torch.load(model_save_path)) # Load weights
     
-    prompt = "Hello, my name is"
+    prompt = "Once upon a time there was"
+    print(f"Prompt: '{prompt}'")
     prompt_ids = tokenizer.encode(prompt, return_tensors="pt").to(DEVICE)
     
     generated_ids = model.generate(
@@ -183,5 +222,7 @@ if __name__ == "__main__":
         top_k=50
     )
     
-    generated_text = tokenizer.decode(generated_ids[0])
+    generated_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+    print("\n--- Generated Text ---")
     print(generated_text)
+
