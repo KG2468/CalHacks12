@@ -30,15 +30,15 @@ except ImportError:
 # No changes here, keep your CONFIG dict as is
 CONFIG = {
     "vocab_size": 50257,
-    "block_size": 256,
+    "block_size": 4096,
     "n_layer": 6,
-    "n_head": 8,
-    "n_embd": 512,
+    "n_head": 10,
+    "n_embd": 640,
     "ff_hidden": 512 * 4,
     "dropout": 0.1,
     "batch_size": 32, # This will be batch size PER GPU
-    "learning_rate": 3e-4,
-    "num_epochs": 15,
+    "learning_rate": 2e-4,
+    "num_epochs": 5,
     "eval_interval": 100,
     "log_interval": 10,
     "device": 'cuda', # We'll determine the specific GPU later
