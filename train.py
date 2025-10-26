@@ -13,9 +13,8 @@ try:
     from attention import SimpleAttentionLM
 except ImportError:
     print("Error: Could not import SimpleAttentionLM from attention.py")
-    print("Please make sure attention.py is in the same directory.")
-    # We won't exit here in case the user is just reading the file
-    # exit()
+    print("Please make sure attention.py is in the same directory and is corrected.")
+    exit()
 
 # --- 1. Config ---
 # We move these into a 'config' dict for W&B
@@ -32,12 +31,14 @@ CONFIG = {
     "num_epochs": 1,
     "eval_interval": 100,
     "log_interval": 10,
-    "checkpoint_interval": 1000, # <-- NEW: Save checkpoint every N steps
     "device": 'cuda' if torch.cuda.is_available() else 'cpu',
     "tokenizer_name": 'EleutherAI/gpt-neo-125M' # <-- W&B: Good to log this
 }
 
 # --- 2. Data Pipeline (MmapDataset) ---
+# (This class is unchanged)
+# --- 2. Data Pipeline (MmapDataset) ---
+# (This class is UNCHANGED... except it is replaced by this new one)
 class MmapDataset(Dataset):
     def __init__(self, bin_file_path, block_size, dtype=np.uint16, offset_tokens=0, max_tokens=None):
         """
@@ -79,8 +80,8 @@ class MmapDataset(Dataset):
         print(f"  - Starting from token {offset_tokens:,} (byte offset {byte_offset:,})")
 
         self.mmap = np.memmap(
-            bin_file_path,  
-            dtype=self.dtype,  
+            bin_file_path, 
+            dtype=self.dtype, 
             mode='r',
             offset=byte_offset, # <-- Use the byte offset
             shape=mmap_shape    # <-- Use the specific shape
@@ -91,12 +92,10 @@ class MmapDataset(Dataset):
 
     def __len__(self):
         # The number of *sequences* we can make
-        # We need block_size + 1 tokens for one (x, y) pair
-        return self.num_tokens - self.block_size
+        return self.num_tokens - self.block_size - 1
 
     def __getitem__(self, idx):
         # This logic remains the same
-        # Get a chunk of block_size + 1 tokens
         chunk = self.mmap[idx : idx + self.block_size + 1]
         x = torch.from_numpy(chunk[:-1].astype(np.int64))
         y = torch.from_numpy(chunk[1:].astype(np.int64))
@@ -107,14 +106,8 @@ class MmapDataset(Dataset):
 def evaluate(model, val_loader, loss_fn):
     model.eval()
     losses = []
-    # Check if val_loader is None (in case of no validation split)
-    if val_loader is None:
-        model.train()
-        return 0.0
-        
     val_iter = iter(val_loader)
-    # Run for a fixed number of eval steps to speed up validation
-    for k in range(100):  
+    for k in range(100): 
         try:
             x, y = next(val_iter)
         except StopIteration:
@@ -136,7 +129,7 @@ if __name__ == "__main__":
     # --- W&B: Initialize Run ---
     wandb.init(
         project="simple-attention-lm-hackathon", # <-- W&B: Name your project
-        config=CONFIG                      # <-- W&B: Pass in your config dict
+        config=CONFIG                          # <-- W&B: Pass in your config dict
     )
     # W&B will create a random run name (e.g., "gentle-brook-5")
     print(f"W&B Run: {wandb.run.name}")
@@ -158,13 +151,13 @@ if __name__ == "__main__":
     print("Loading data...")
 
     # --- THIS IS THE CHANGE YOU REQUESTED ---
-    TOKENS_PART_1 = 476616445  
+    TOKENS_PART_1 = 476616445 
     
     # Load *only* the first part of the dataset
     print("Loading Dataset Part 1...")
     dataset_part_1 = MmapDataset(
-        DATA_FILE,  
-        CONFIG['block_size'],  
+        DATA_FILE, 
+        CONFIG['block_size'], 
         dtype=np.uint16,
         offset_tokens=0,           # Start from the beginning
         max_tokens=TOKENS_PART_1   # Load only this many tokens
@@ -174,8 +167,8 @@ if __name__ == "__main__":
     # you would just change the parameters like this:
     # print("Loading Dataset Part 2...")
     # dataset_part_2 = MmapDataset(
-    #     DATA_FILE,  
-    #     CONFIG['block_size'],  
+    #     DATA_FILE, 
+    #     CONFIG['block_size'], 
     #     dtype=np.uint16,
     #     offset_tokens=TOKENS_PART_1, # Start *after* part 1
     #     max_tokens=None              # Load all remaining tokens
@@ -185,34 +178,43 @@ if __name__ == "__main__":
     
     # Now, we split dataset_part_1 into train/val
     # The rest of the script will *only* train on this first part.
-    n = len(dataset_part_1)  
+    n = len(dataset_part_1) 
     train_n = int(n * 0.9)
     val_n = n - train_n
     
-    val_data = None
-    
-    # Handle the case where the validation set is too small or zero
-    if val_n < 10: # If val split is tiny, just use everything for training
-        print(f"Warning: Validation split is very small ({val_n}). Using entire partition for training.")
+    # Handle the case where the validation set is empty
+    if val_n == 0:
+        print("Warning: Validation split is 0. Using entire partition for training.")
         train_n = n
-        val_n = 0
         train_data = dataset_part_1
-        val_data = None # Explicitly set to None
-    else:
+        # Create a dummy val_data to avoid errors, though it won't be used meaningfully
+        # Or, better, adjust the evaluation logic
+        # For simplicity, we'll just split 90/10 even if val_n is tiny
+        if n > 10: # Ensure we have enough data to split
+            train_n = int(n * 0.9)
+            val_n = n - train_n
+        else:
+            train_n = n
+            val_n = 0 # No validation
+            
+    if val_n > 0:
         train_data, val_data = torch.utils.data.random_split(
             dataset_part_1, # <-- Use the partial dataset
             [train_n, val_n],
             generator=torch.Generator().manual_seed(42)
         )
+    else:
+        train_data = dataset_part_1
+        val_data = None # Handle this in your eval loop
     
     print(f"Total sequences (from Part 1): {n:,}")
     print(f"Train sequences: {len(train_data):,}, Val sequences: {len(val_data) if val_data else 0:,}")
     
     train_loader = DataLoader(
-        train_data,  
-        batch_size=CONFIG['batch_size'],  
-        shuffle=True,  
-        pin_memory=True,  
+        train_data, 
+        batch_size=CONFIG['batch_size'], 
+        shuffle=True, 
+        pin_memory=True, 
         num_workers=4 if CONFIG['device'] == 'cuda' else 0
     )
     
@@ -220,49 +222,36 @@ if __name__ == "__main__":
     val_loader = None
     if val_data:
         val_loader = DataLoader(
-            val_data,  
-            batch_size=CONFIG['batch_size'],  
-            pin_memory=True,  
+            val_data, 
+            batch_size=CONFIG['batch_size'], 
+            pin_memory=True, 
             num_workers=4 if CONFIG['device'] == 'cuda' else 0
         )
 
     # --- Init Model ---
     print("Initializing model...")
     # Use the 'config' dict for model init
-    # Make sure the SimpleAttentionLM class definition is available (from attention.py)
-    if 'SimpleAttentionLM' in globals():
-        model = SimpleAttentionLM(
-            vocab_size=CONFIG['vocab_size'],
-            block_size=CONFIG['block_size'],
-            n_layer=CONFIG['n_layer'],
-            n_head=CONFIG['n_head'],
-            n_embd=CONFIG['n_embd'],
-            ff_hidden=CONFIG['ff_hidden'],
-            dropout=CONFIG['dropout']
-        ).to(CONFIG['device'])
-        
-        # --- W&B: Watch Model ---
-        # This logs gradients, parameters, and model architecture
-        wandb.watch(model, log='all', log_freq=CONFIG['log_interval'])
-        
-        param_count = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6
-        print(f"Model parameters: {param_count:.2f}M")
-        wandb.run.summary["model_parameters_M"] = param_count # <-- W&B: Save param count
-    else:
-        print("Error: SimpleAttentionLM class not found. Skipping model initialization.")
-        print("Please ensure attention.py is imported correctly.")
-        wandb.finish()
-        exit()
-
+    model = SimpleAttentionLM(
+        vocab_size=CONFIG['vocab_size'],
+        block_size=CONFIG['block_size'],
+        n_layer=CONFIG['n_layer'],
+        n_head=CONFIG['n_head'],
+        n_embd=CONFIG['n_embd'],
+        ff_hidden=CONFIG['ff_hidden'],
+        dropout=CONFIG['dropout']
+    ).to(CONFIG['device'])
+    
+    # --- W&B: Watch Model ---
+    # This logs gradients, parameters, and model architecture
+    wandb.watch(model, log='all', log_freq=CONFIG['log_interval'])
+    
+    param_count = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6
+    print(f"Model parameters: {param_count:.2f}M")
+    wandb.run.summary["model_parameters_M"] = param_count # <-- W&B: Save param count
 
     # --- Init Optimizer & Loss ---
     optimizer = AdamW(model.parameters(), lr=CONFIG['learning_rate'])
     loss_fn = nn.CrossEntropyLoss()
-
-    # --- W&B: Create a checkpoint directory for this run ---
-    checkpoint_dir = f"checkpoints/{wandb.run.name}"
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    print(f"Checkpoints will be saved to: {checkpoint_dir}")
 
     # --- Training Loop ---
     print("Starting training...")
@@ -311,68 +300,39 @@ if __name__ == "__main__":
                     "val_loss": val_loss
                 })
 
-            # --- NEW: Checkpointing Logic ---
-            if step % CONFIG['checkpoint_interval'] == 0 and step > 0:
-                checkpoint_path = os.path.join(checkpoint_dir, f"step_{step}.pt")
-                torch.save(model.state_dict(), checkpoint_path)
-                print(f"--- Checkpoint Saved ---")
-                print(f"Step {step} | Model saved to {checkpoint_path}")
-                print(f"------------------------")
-                
-                # --- W&B: Log that a checkpoint was saved ---
-                wandb.log({
-                    "step": step,
-                    "checkpoint_saved_at_step": step
-                })
-                
-                # (Optional) Save as a W&B Artifact
-                # This will upload the .pt file to W&B
-                # artifact = wandb.Artifact(f'model-{wandb.run.name}', type='model')
-                # artifact.add_file(checkpoint_path, name=f"step_{step}.pt")
-                # wandb.log_artifact(artifact, aliases=[f"step_{step}"])
-                # print("Logged checkpoint artifact to W&B.")
-            # --- End of Checkpointing Logic ---
-
         epoch_time = time.time() - epoch_start_time
         print(f"Epoch {epoch+1} finished in {epoch_time:.2f}s")
         
     print("Training finished.")
     
-    # --- Save the final model ---
-    final_model_path = os.path.join(checkpoint_dir, "final.pt")
-    torch.save(model.state_dict(), final_model_path)
-    print(f"Final model saved to {final_model_path}")
+    # --- Save the model ---
+    model_save_path = "simple_lm_custom_dataset.pt"
+    torch.save(model.state_dict(), model_save_path)
+    print(f"Model saved to {model_save_path}")
     
     # --- Test Generation ---
     print("\n--- Testing Generation ---")
-    # Load the final model weights for generation
-    model.load_state_dict(torch.load(final_model_path)) 
-    model.eval() # Set model to evaluation mode for generation
+    model.load_state_dict(torch.load(model_save_path)) # Load weights
     
     prompt = "Once upon a time there was"
     print(f"Prompt: '{prompt}'")
     prompt_ids = tokenizer.encode(prompt, return_tensors="pt").to(CONFIG['device'])
     
-    # Ensure the model's generate function exists
-    if hasattr(model, 'generate') and callable(model.generate):
-        generated_ids = model.generate(
-            prompt_ids,  
-            max_new_tokens=50,  
-            temperature=0.8,  
-            top_k=50
-        )
-        
-        generated_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
-        print("\n--- Generated Text ---")
-        print(generated_text)
-        
-        # --- W&B: Log generated text sample as a Table ---
-        generation_table = wandb.Table(columns=["step", "prompt", "generated_text"])
-        generation_table.add_data(step, prompt, generated_text)
-        wandb.log({"generation_samples": generation_table})
-    else:
-        print("Error: model.generate() method not found.")
-        print("Please ensure your SimpleAttentionLM class has a 'generate' method.")
+    generated_ids = model.generate(
+        prompt_ids, 
+        max_new_tokens=50, 
+        temperature=0.8, 
+        top_k=50
+    )
+    
+    generated_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+    print("\n--- Generated Text ---")
+    print(generated_text)
+    
+    # --- W&B: Log generated text sample as a Table ---
+    generation_table = wandb.Table(columns=["step", "prompt", "generated_text"])
+    generation_table.add_data(step, prompt, generated_text)
+    wandb.log({"generation_samples": generation_table})
 
     # --- W&B: Finish the run ---
     wandb.finish()

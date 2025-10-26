@@ -27,7 +27,6 @@ except ImportError:
     exit()
 
 # --- 1. Config ---
-# No changes here, keep your CONFIG dict as is
 CONFIG = {
     "vocab_size": 50257,
     "block_size": 2048,
@@ -41,12 +40,12 @@ CONFIG = {
     "num_epochs": 5,
     "eval_interval": 100,
     "log_interval": 10,
+    "save_interval": 200, # <-- ADDED: Save checkpoint every N steps
     "device": 'cuda', # We'll determine the specific GPU later
     "tokenizer_name": 'EleutherAI/gpt-neo-125M'
 }
 
 # --- 2. Data Pipeline (MmapDataset) ---
-# Use the separate Train/Val datasets from the previous fix
 # (MmapTrainDataset and MmapValDataset classes are unchanged)
 class MmapTrainDataset(Dataset):
     def __init__(self, bin_file_path, block_size, train_split=0.9, dtype=np.uint16):
@@ -324,6 +323,39 @@ if __name__ == "__main__":
                     })
                 # ----------------------------------------------------
                 model.train() # Ensure model is back in training mode
+            
+            # --- [NEW] Save checkpoint every N steps ---
+            if step % CONFIG['save_interval'] == 0 and step > 0:
+                if rank == 0: # Only rank 0 saves the checkpoint
+                    ckpt_dir = "checkpoints"
+                    os.makedirs(ckpt_dir, exist_ok=True)
+                    # Change filename to be step-based
+                    ckpt_path = os.path.join(ckpt_dir, f"model_step_{step}.pt") 
+
+                    save_model = model.module if is_ddp else model
+                    torch.save(save_model.state_dict(), ckpt_path)
+                    print(f"[Checkpoint] Saved model checkpoint -> {ckpt_path}")
+
+                    # Optionally sync with W&B
+                    wandb.save(ckpt_path)
+
+                    # Optional: limit number of checkpoints to keep (e.g., last 3)
+                    MAX_CHECKPOINTS = 3
+                    # Get all step checkpoints
+                    ckpts = sorted(
+                        [f for f in os.listdir(ckpt_dir) if f.startswith("model_step_") and f.endswith(".pt")],
+                        # Sort by the step number (the integer after '_')
+                        key=lambda f: int(f.split('_')[-1].split('.')[0]) 
+                    )
+                    if len(ckpts) > MAX_CHECKPOINTS:
+                        old_ckpt = os.path.join(ckpt_dir, ckpts[0])
+                        try:
+                            os.remove(old_ckpt)
+                            print(f"[Checkpoint] Deleted old checkpoint -> {old_ckpt}")
+                        except OSError as e:
+                            print(f"[Checkpoint] Error deleting old checkpoint {old_ckpt}: {e}")
+            # --- End of [NEW] Checkpoint block ---
+
 
         # --- Sync at end of epoch ---
         if is_ddp:
@@ -332,38 +364,20 @@ if __name__ == "__main__":
         epoch_time = time.time() - epoch_start_time
         if rank == 0:
             print(f"Epoch {epoch+1} finished in {epoch_time:.2f}s")
-
-            # --- Save model checkpoint every epoch ---
-            ckpt_dir = "checkpoints"
-            os.makedirs(ckpt_dir, exist_ok=True)
-            ckpt_path = os.path.join(ckpt_dir, f"model_epoch_{epoch+1}.pt")
-
-            save_model = model.module if is_ddp else model
-            torch.save(save_model.state_dict(), ckpt_path)
-            print(f"[Checkpoint] Saved model checkpoint -> {ckpt_path}")
-
-            # Optionally sync with W&B
-            wandb.save(ckpt_path)
-
-            # Optional: limit number of checkpoints to keep (e.g., last 3)
-            # MAX_CHECKPOINTS = 3
-            # ckpts = sorted(
-            #     [f for f in os.listdir(ckpt_dir) if f.startswith("model_epoch_")]
-            # )
-            # if len(ckpts) > MAX_CHECKPOINTS:
-            #     old_ckpt = os.path.join(ckpt_dir, ckpts[0])
-            #     os.remove(old_ckpt)
-            #     print(f"[Checkpoint] Deleted old checkpoint -> {old_ckpt}")
+            
+            # --- [MOVED] Save model checkpoint every epoch ---
+            # This logic has been moved into the step loop above.
 
     if rank == 0: print("Training finished.")
 
-    # --- Save the model (only rank 0) ---
+    # --- Save the final model (only rank 0) ---
     if rank == 0:
-        model_save_path = "simple_lm_custom_dataset_ddp.pt"
+        # Renamed to _final to avoid conflicting with step checkpoints
+        model_save_path = "simple_lm_custom_dataset_ddp_final.pt" 
         # Save the underlying model state dict
         save_model = model.module if is_ddp else model
         torch.save(save_model.state_dict(), model_save_path)
-        print(f"Model saved to {model_save_path}")
+        print(f"Final model saved to {model_save_path}")
 
         # --- Test Generation (only rank 0) ---
         print("\n--- Testing Generation ---")
