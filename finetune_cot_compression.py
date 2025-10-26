@@ -322,7 +322,7 @@ def train_epoch(small_model, large_model, large_tokenizer, train_loader, optimiz
             
             # Final step: generate final answer
             last_cot_group = cot_groups[-1]
-            if not isinstance(last_cot_group, torch.Tensor):
+            if isinstance(last_cot_group, torch.Tensor):
                 # Backpropagation
                 optimizer.zero_grad()
                 batch_loss.backward()
