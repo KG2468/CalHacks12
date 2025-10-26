@@ -12,7 +12,7 @@ from pruner import Pruner, PrunerWithSVD  # your existing file
 # ================================================================
 # I.  Model and Data Setup
 # ================================================================
-# MODEL_NAME = "google/gemma-3-270m"
+MODEL_NAME = "Qwen/Qwen3-8B"
 MAX_LEN = 128
 PROMPT = "The capital of France is"
 
