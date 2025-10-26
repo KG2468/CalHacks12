@@ -429,7 +429,7 @@ def main():
         if rank == 0:
             print("\n" + "="*70)
             print("Training completed!")
-            print("="*7Example 30)
+            print("="*70)
         
     except KeyboardInterrupt:
         if rank == 0:
