@@ -16,6 +16,8 @@ MODEL_NAME = "google/gemma-3-270m"
 MAX_LEN = 128
 PROMPT = "The capital of France is"
 
+PRUNED_SVD_PATH = "gemma_quantized_final.pth"
+
 # Tokenizer
 TOKENIZER = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=False)
 TOKENIZER.pad_token = TOKENIZER.eos_token
@@ -110,13 +112,14 @@ def benchmark_generation_speed(model, prompt, tokenizer, device):
 # ================================================================
 if __name__ == "__main__":
     # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        print("MPS is available")
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
+    # if torch.cuda.is_available():
+    #     device = torch.device("cuda")
+    # elif torch.backends.mps.is_available():
+    #     print("MPS is available")
+    #     device = torch.device("mps")
+    # else:
+    #     device = torch.device("cpu")
+    
     dtype = torch.bfloat16 if (device.type == "cuda" and torch.cuda.get_device_capability()[0] >= 8) else torch.float16
     print(f"\nRunning Gemma Pruning + SVD Test on {device} ({dtype})")
 
