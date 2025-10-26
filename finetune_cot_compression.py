@@ -81,7 +81,7 @@ def split_cot_into_groups(cot_steps: List[torch.Tensor], min_groups: int = 3, ma
     groups = []
     for i in range(0, num_steps, group_size):
         group = cot_steps[i:i + group_size]
-        if group:  # Only add non-empty groups
+        if len(group) > 0:  # Only add non-empty groups
             groups.append(group)
     
     return groups
