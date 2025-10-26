@@ -29,7 +29,7 @@ SMALL_DROPOUT = 0.1
 
 # Training hyperparameters
 BATCH_SIZE = 1  # Process one example at a time due to complex logic
-LEARNING_RATE = 1e-5
+LEARNING_RATE = 4e-4
 NUM_EPOCHS = 3
 LOG_INTERVAL = 10
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
