@@ -1,3 +1,4 @@
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
@@ -20,7 +21,7 @@ except ImportError:
 # --- 1. Config ---
 # Small model (the one we're training)
 SMALL_VOCAB_SIZE = 50257
-SMALL_BLOCK_SIZE = 4096
+SMALL_BLOCK_SIZE = 2048
 SMALL_N_LAYER = 6
 SMALL_N_HEAD = 8
 SMALL_N_EMBD = 512
