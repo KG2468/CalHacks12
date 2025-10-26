@@ -331,6 +331,7 @@ def train_epoch(small_model, large_model, large_tokenizer, train_loader, optimiz
                 
                 total_loss += batch_loss.item()
                 num_batches += 1
+                continue
             last_cot_tokens = torch.cat(last_cot_group, dim=0).unsqueeze(0).to(device)
             final_input = torch.cat([current_input, last_cot_tokens], dim=1)
             
