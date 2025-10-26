@@ -401,7 +401,7 @@ class StochasticPruner(Pruner):
         self,
         eval_dataloader: DataLoader,
         loss_fn: _Loss,
-        chunk_size_params: int = 500_000_000,
+        num_chunks: int = 15,            # <-- CHANGED: Specify number of chunks
         num_masks_per_chunk: int = 500,
         sparsity_per_mask: float = 0.5,
         top_k_masks: int = 20,
@@ -412,13 +412,33 @@ class StochasticPruner(Pruner):
         as described by the user.
         """
         print("--- Starting Stochastic Consensus Pruning ---")
+
+        # --- Dynamically calculate chunk size ---
+        total_prunable_params = sum(p.numel() for p in self.name_to_param.values())
+        if total_prunable_params == 0:
+            print("Warning: No prunable parameters found. Exiting.")
+            return
+            
+        if num_chunks <= 0:
+            print(f"Warning: num_chunks must be > 0. Setting to 1.")
+            num_chunks = 1
+            
+        # Ceiling division to get chunk size
+        chunk_size_params = (total_prunable_params + num_chunks - 1) // num_chunks
+        
+        print(f"Total prunable params: {total_prunable_params:,}")
+        print(f"Requested num_chunks: {num_chunks}")
+        print(f"Calculated chunk_size_params: {chunk_size_params:,} (params per chunk)")
+        # --- End dynamic calculation ---
+
         if consensus_k > top_k_masks:
             print(f"Warning: consensus_k ({consensus_k}) > top_k_masks ({top_k_masks}).")
             print(f"Setting consensus_k = {top_k_masks} (i.e., full intersection).")
             consensus_k = top_k_masks
 
         # 1. Chunk parameters
-        print(f"Grouping parameters into chunks of ~{chunk_size_params} params...")
+        #    This print statement now uses the *calculated* chunk_size_params
+        print(f"Grouping parameters into chunks of ~{chunk_size_params:,} params...")
         param_chunks = self._get_param_chunks(chunk_size_params)
         print(f"Total prunable parameters chunked into {len(param_chunks)} chunks.")
 
@@ -579,14 +599,14 @@ if __name__ == "__main__":
     nonzero, total = count_nonzero(model_stoch)
     print(f"Before prune: nonzero={nonzero}/{total} ({nonzero/total*100:.2f}%)")
     
-    # For a SimpleModel, 500M is huge. Let's use a small chunk size.
-    # Total params = (100*64) + (64*10) = 6400 + 640 = 7040 (prunable weights)
-    # Let's make 2 chunks of ~4000 params each.
+    # For a SimpleModel, total prunable params = 7040.
+    # The comment originally said "Let's make 2 chunks".
+    # So we now pass num_chunks=2.
     
     pruner_stoch.prune_stochastic_consensus(
         eval_dataloader=eval_dataloader,
         loss_fn=loss_fn,
-        chunk_size_params=4000,       # Chunk size (set to 500e6 for your 8B model)
+        num_chunks=2,                 # <-- CHANGED: We want 2 chunks
         num_masks_per_chunk=50,       # Num random masks to test (set to 500-1000)
         sparsity_per_mask=0.5,        # Sparsity for each random mask
         top_k_masks=10,               # Find 10 best-performing masks
