@@ -9,6 +9,75 @@ from torch.utils.data import DataLoader, TensorDataset
 # - Generates masks from multiple criteria (magnitude, gradient, etc.)
 # - Prunes weights that are flagged by a "majority vote" (k-out-of-N)
 
+# ===================================================================
+# --- BEGIN PARALLEL WORKER FUNCTION ---
+# ===================================================================
+
+def _parallel_eval_worker(
+    model_cpu: nn.Module,
+    keep_mask: Dict[str, torch.Tensor],
+    eval_dataloader: DataLoader,
+    loss_fn: _Loss
+) -> float:
+    """
+    Standalone worker function for parallel mask evaluation on the CPU.
+    
+    This function receives a *copy* of the model on the CPU and a
+    mask (which might be on the GPU). It performs the evaluation
+    entirely on the CPU to avoid GPU memory conflicts.
+    """
+    
+    # 1. Find the parameters this mask touches
+    name_to_param = {}
+    for module_name, module in model_cpu.named_modules():
+        for name, param in list(module.named_parameters(recurse=False)):
+            full_name = f"{module_name}.{name}" if module_name else name
+            if name.endswith("weight") and param is not None and full_name in keep_mask:
+                name_to_param[full_name] = param
+
+    # 2. Backup original weights (from the CPU model copy)
+    original_weights = {
+        name: name_to_param[name].data.clone()
+        for name in keep_mask.keys() if name in name_to_param
+    }
+
+    # 3. Apply the temporary mask (in-place on the CPU model)
+    with torch.no_grad():
+        for name, mask in keep_mask.items():
+            if name in name_to_param:
+                param = name_to_param[name]
+                # Ensure mask is on CPU before applying
+                param.data.mul_(mask.to("cpu"))
+
+    # 4. Evaluate the model (on CPU)
+    model_cpu.eval() # Set to eval mode
+    total_loss = 0.0
+    total_samples = 0
+    with torch.no_grad():
+        for batch in eval_dataloader:
+            try:
+                # Data from loader might be on GPU, move to CPU
+                inputs, labels = [d.to("cpu") for d in batch]
+            except (ValueError, TypeError):
+                print("Warning: Could not unpack (inputs, labels) from eval batch in worker.")
+                continue
+                
+            outputs = model_cpu(inputs)
+            loss = loss_fn(outputs, labels)
+            total_loss += loss.item() * inputs.size(0)
+            total_samples += inputs.size(0)
+    
+    avg_loss = total_loss / total_samples if total_samples > 0 else float('inf')
+
+    # 5. Restore original weights (good practice, though this model copy is discarded)
+    with torch.no_grad():
+        for name, original_data in original_weights.items():
+            if name in name_to_param:
+                name_to_param[name].data.copy_(original_data)
+                
+    return avg_loss
+
+
 class Pruner:
     """
     Custom model pruner with consensus-based pruning.
@@ -277,7 +346,7 @@ class Pruner:
 
 
 # ===================================================================
-# --- BEGIN NOVEL STOCHASTIC PRUNER ---
+# --- BEGIN NOVEL STOCHASTIC PRUNER (Parallelized) ---
 # ===================================================================
 
 class StochasticPruner(Pruner):
@@ -290,6 +359,7 @@ class StochasticPruner(Pruner):
        a. Generate N (e.g., 500-1000) random candidate masks for that chunk.
        b. For each candidate mask, *temporarily* apply it and evaluate the 
           model's performance (e.g., loss) on a small dataset.
+          **This step is parallelized across multiple CPU cores.**
        c. Keep the "Top K" (e.g., 20) masks that resulted in the best performance.
        d. Compute a "consensus" mask for the chunk from these Top K masks.
     3. After all chunks are processed, combine the consensus masks and
@@ -402,17 +472,30 @@ class StochasticPruner(Pruner):
         self,
         eval_dataloader: DataLoader,
         loss_fn: _Loss,
-        num_chunks: int = 15,            # <-- CHANGED: Specify number of chunks
+        num_chunks: int = 15,
         num_masks_per_chunk: int = 500,
         sparsity_per_mask: float = 0.5,
         top_k_masks: int = 20,
-        consensus_k: int = 20
+        consensus_k: int = 20,
+        num_workers: int = 0
     ):
         """
-        Implements the novel stochastic consensus pruning algorithm
-        as described by the user.
+        Implements the novel stochastic consensus pruning algorithm.
+        
+        **NEW ARGUMENT:**
+        - num_workers: Number of parallel CPU processes to use for mask
+                       evaluation. If 0, runs serially (original behavior).
+                       Set to os.cpu_count() for max parallelism.
         """
         print("--- Starting Stochastic Consensus Pruning ---")
+        
+        # --- Handle parallel processing settings ---
+        max_workers = 0
+        if num_workers > 0:
+            max_workers = min(num_workers, os.cpu_count() or 1)
+            print(f"Parallel processing enabled with {max_workers} workers.")
+        else:
+            print("Running in serial mode (num_workers=0).")
 
         # --- Dynamically calculate chunk size ---
         total_prunable_params = sum(p.numel() for p in self.name_to_param.values())
@@ -438,7 +521,6 @@ class StochasticPruner(Pruner):
             consensus_k = top_k_masks
 
         # 1. Chunk parameters
-        #    This print statement now uses the *calculated* chunk_size_params
         print(f"Grouping parameters into chunks of ~{chunk_size_params:,} params...")
         param_chunks = self._get_param_chunks(chunk_size_params)
         print(f"Total prunable parameters chunked into {len(param_chunks)} chunks.")
@@ -455,28 +537,69 @@ class StochasticPruner(Pruner):
             print(f"\n--- Processing Chunk {i+1}/{len(param_chunks)} ---")
             chunk_mask_scores = [] # List to store (score, keep_mask)
 
-            # 3. Generate and evaluate N random masks for this chunk
-            print(f"Generating and evaluating {num_masks_per_chunk} random masks...")
-            for j in range(num_masks_per_chunk):
-                # This mask dictionary only contains keys for the current chunk
-                random_chunk_keep_mask = self._generate_random_keep_mask_for_chunk(
-                    chunk, sparsity_per_mask
+            # 3. Generate N random masks for this chunk
+            print(f"Generating {num_masks_per_chunk} random masks...")
+            masks_to_eval = []
+            for _ in range(num_masks_per_chunk):
+                masks_to_eval.append(
+                    self._generate_random_keep_mask_for_chunk(chunk, sparsity_per_mask)
                 )
-                
-                # Evaluate the model with this *partial* mask
-                avg_loss = self._evaluate_model_with_temp_mask(
-                    random_chunk_keep_mask, eval_dataloader, loss_fn
-                )
-                
-                # We store score = -loss (since lower loss is better)
-                # We also move the mask to CPU to save GPU RAM
-                cpu_mask = {k: v.to("cpu") for k, v in random_chunk_keep_mask.items()}
-                chunk_mask_scores.append( (-avg_loss, cpu_mask) )
 
-                if (j+1) % (num_masks_per_chunk // 10 or 1) == 0:
-                    print(f"  ... evaluated mask {j+1}/{num_masks_per_chunk} (Loss: {avg_loss:.4f})")
+            # 4. Evaluate N masks (serially or in parallel)
+            if max_workers > 0:
+                # --- PARALLEL PATH ---
+                print(f"Evaluating {len(masks_to_eval)} masks in parallel...")
+                # Move model to CPU *once* to be pickled and sent to workers
+                model_cpu = self.model.to("cpu")
+                
+                with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                    # Submit all jobs
+                    futures = [
+                        executor.submit(
+                            _parallel_eval_worker,
+                            model_cpu,
+                            mask,
+                            eval_dataloader,
+                            loss_fn
+                        )
+                        for mask in masks_to_eval
+                    ]
+                    
+                    # Collect results as they complete
+                    for j, future in enumerate(futures):
+                        avg_loss = future.result()
+                        # Get the corresponding mask (masks_to_eval[j])
+                        # We store score = -loss (lower loss is better)
+                        # We also move the mask to CPU to save GPU RAM
+                        cpu_mask = {k: v.to("cpu") for k, v in masks_to_eval[j].items()}
+                        chunk_mask_scores.append( (-avg_loss, cpu_mask) )
 
-            # 4. Find the top K masks for this chunk
+                        if (j+1) % (num_masks_per_chunk // 10 or 1) == 0:
+                            print(f"  ... collected result {j+1}/{num_masks_per_chunk} (Loss: {avg_loss:.4f})")
+                
+                # Move main model back to original device (if it was on CPU, this is a no-op)
+                self.model.to(self.device)
+
+            else:
+                # --- SERIAL PATH ---
+                print(f"Evaluating {len(masks_to_eval)} masks serially...")
+                for j, random_chunk_keep_mask in enumerate(masks_to_eval):
+                    # Evaluate the model with this *partial* mask
+                    avg_loss = self._evaluate_model_with_temp_mask(
+                        random_chunk_keep_mask, eval_dataloader, loss_fn
+                    )
+                    
+                    # We store score = -loss (since lower loss is better)
+                    # We also move the mask to CPU to save GPU RAM
+                    cpu_mask = {k: v.to("cpu") for k, v in random_chunk_keep_mask.items()}
+                    chunk_mask_scores.append( (-avg_loss, cpu_mask) )
+
+                    if (j+1) % (num_masks_per_chunk // 10 or 1) == 0:
+                        print(f"  ... evaluated mask {j+1}/{num_masks_per_chunk} (Loss: {avg_loss:.4f})")
+            
+            # --- End of parallel/serial block ---
+
+            # 5. Find the top K masks for this chunk
             chunk_mask_scores.sort(key=lambda x: x[0], reverse=True) # Sort by score (high to low)
             top_masks = [mask for score, mask in chunk_mask_scores[:top_k_masks]]
             
@@ -486,8 +609,7 @@ class StochasticPruner(Pruner):
 
             print(f"Found top {len(top_masks)} masks. Computing consensus...")
 
-            # 5. Get consensus (overlap) from the top K masks
-            # This is just like the original prune_consensus, but applied to this chunk
+            # 6. Get consensus (overlap) from the top K masks
             for name in chunk.keys():
                 # Get all top masks for this specific parameter
                 mask_list = [m[name].to(self.device) for m in top_masks if name in m]
@@ -506,7 +628,7 @@ class StochasticPruner(Pruner):
                 # Store this chunk's result in the *global* final mask (on CPU)
                 final_keep_mask_cpu[name] = chunk_final_keep.to("cpu")
 
-        # 6. Apply the final combined mask
+        # 7. Apply the final combined mask
         print("\n--- Stochastic Consensus Pruning Finished ---")
         print("Applying final combined mask to model...")
         
