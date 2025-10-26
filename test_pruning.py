@@ -113,14 +113,14 @@ def benchmark_generation_speed(model, prompt, tokenizer, device):
 # III.  Experiment
 # ================================================================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Evaluate hardware optimizations on a Hugging Face model.")
-    parser.add_argument(
-        "--model_name",
-        type=str,
-        default="Qwen/Qwen3-8B",
-        help="The Hugging Face model to evaluate (e.g., 'google/gemma-3-270m', 'mistralai/Mistral-7B-v0.1')."
-    )
-    args = parser.parse_args()
+    # parser = argparse.ArgumentParser(description="Evaluate hardware optimizations on a Hugging Face model.")
+    # parser.add_argument(
+    #     "--model_name",
+    #     type=str,
+    #     default="Qwen/Qwen3-8B",
+    #     help="The Hugging Face model to evaluate (e.g., 'google/gemma-3-270m', 'mistralai/Mistral-7B-v0.1')."
+    # )
+    # args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if torch.cuda.is_available():
