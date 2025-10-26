@@ -199,7 +199,7 @@ if __name__ == "__main__":
         TARGET_DTYPE = torch.float32 # CPU must use float32
 
     # Dynamic Paths
-    # safe_model_name = args.model_name.replace("/", "_")
+    safe_model_name = MODEL_NAME.replace("/", "_")
     PRUNED_SVD_PATH = f"{safe_model_name}_pruned_svd_final.pth"
     OUTPUT_PATH = f"{safe_model_name}_quantized_final.pth"
 
