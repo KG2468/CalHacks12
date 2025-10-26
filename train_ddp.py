@@ -30,7 +30,7 @@ except ImportError:
 # No changes here, keep your CONFIG dict as is
 CONFIG = {
     "vocab_size": 50257,
-    "block_size": 2048,
+    "block_size": 4096,
     "n_layer": 6,
     "n_head": 8,
     "n_embd": 512,
@@ -159,6 +159,12 @@ def evaluate(model, val_loader, loss_fn, device, is_ddp): # <-- Added device, is
 if __name__ == "__main__":
     # --- Setup DDP ---
     is_ddp, rank, world_size, local_rank = setup_ddp()
+    seed = 42 + rank  # different seed per rank if needed
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    np.random.seed(seed)
+    import random
+    random.seed(seed)
     device = f'cuda:{local_rank}' if is_ddp else CONFIG['device'] # Assign GPU
     # Update CONFIG for clarity, though device is passed explicitly now
     CONFIG['device'] = device
