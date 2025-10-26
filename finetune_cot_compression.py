@@ -322,6 +322,15 @@ def train_epoch(small_model, large_model, large_tokenizer, train_loader, optimiz
             
             # Final step: generate final answer
             last_cot_group = cot_groups[-1]
+            if not isinstance(last_cot_group, torch.Tensor):
+                # Backpropagation
+                optimizer.zero_grad()
+                batch_loss.backward()
+                torch.nn.utils.clip_grad_norm_(small_model.parameters(), 1.0)
+                optimizer.step()
+                
+                total_loss += batch_loss.item()
+                num_batches += 1
             last_cot_tokens = torch.cat(last_cot_group, dim=0).unsqueeze(0).to(device)
             final_input = torch.cat([current_input, last_cot_tokens], dim=1)
             
