@@ -12,7 +12,7 @@ from pruner import Pruner, PrunerWithSVD  # your existing file
 # ================================================================
 # I.  Model and Data Setup
 # ================================================================
-MODEL_NAME = "google/gemma-3-270m"
+# MODEL_NAME = "google/gemma-3-270m"
 MAX_LEN = 128
 PROMPT = "The capital of France is"
 
@@ -117,7 +117,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model_name",
         type=str,
-        default="google/gemma-3-270m",
+        default="Qwen/Qwen3-8B",
         help="The Hugging Face model to evaluate (e.g., 'google/gemma-3-270m', 'mistralai/Mistral-7B-v0.1')."
     )
     args = parser.parse_args()
