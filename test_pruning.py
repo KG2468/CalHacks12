@@ -1,12 +1,10 @@
 """
 test_pruner_svd.py
-Evaluates pruning and pruning+SVD compression on a specified Hugging Face model.
+Evaluates pruning and pruning+SVD compression on Gemma-3-270M.
 Follows the same measurement structure as test_hardware_optimizer.py.
 """
 
 import os, time, torch, torch.nn as nn
-import argparse  # Added argparse
-import tempfile
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from pruner import Pruner, PrunerWithSVD  # your existing file
@@ -14,11 +12,16 @@ from pruner import Pruner, PrunerWithSVD  # your existing file
 # ================================================================
 # I.  Model and Data Setup
 # ================================================================
-# MODEL_NAME = "google/gemma-3-270m" # Removed hardcoded name
+MODEL_NAME = "google/gemma-3-270m"
 MAX_LEN = 128
 PROMPT = "The capital of France is"
 
-# Tokenizer now loaded in main
+PRUNED_SVD_PATH = "gemma_quantized_final.pth"
+
+# Tokenizer
+TOKENIZER = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=False)
+TOKENIZER.pad_token = TOKENIZER.eos_token
+
 
 class MockLLMDataset(Dataset):
     def __init__(self, tokenizer, size=100, max_len=MAX_LEN):
@@ -37,14 +40,15 @@ class MockLLMDataset(Dataset):
         return {k: v.squeeze(0) for k, v in enc.items()}, torch.tensor(0)
 
 
-def load_model(model_name, dtype, device): # Renamed function
-    """Loads a model with specified name, dtype, and device."""
+def load_gemma_model(dtype, device):
+    LARGE_MODEL_NAME = "Qwen/Qwen3-8B"
     model = AutoModelForCausalLM.from_pretrained(
-        model_name, # Use argument
+        LARGE_MODEL_NAME,
         torch_dtype=dtype,
         device_map=device,
         low_cpu_mem_usage=True
     )
+    
     model.eval()
     return model
 
@@ -52,9 +56,10 @@ def load_model(model_name, dtype, device): # Renamed function
 # ================================================================
 # II.  Metrics
 # ================================================================
+import tempfile
+import os
 
 def get_model_size_mb(model):
-    """Calculates the size of a model in megabytes."""
     model.cpu()
     with tempfile.NamedTemporaryFile(delete=False) as tmp:
         torch.save(model.state_dict(), tmp.name)
@@ -65,30 +70,22 @@ def get_model_size_mb(model):
 
 @torch.no_grad()
 def evaluate_perplexity(model, loader, device):
-    """Calculates perplexity on a test dataloader."""
     model.to(device)
     model.eval()
     total_loss, total_tokens = 0, 0
     for batch, _ in loader:
         input_ids = batch["input_ids"].to(device)
         attn = batch["attention_mask"].to(device)
-        # Get loss
         loss = model(input_ids, attention_mask=attn, labels=input_ids).loss.item()
         n_tokens = attn.sum().item()
-        # Accumulate weighted loss
         total_loss += loss * n_tokens
         total_tokens += n_tokens
-    
-    if total_tokens == 0:
-        return float('inf') # Avoid division by zero
-        
     avg_loss = total_loss / total_tokens
     return float(torch.exp(torch.tensor(avg_loss)))
 
 
 @torch.no_grad()
 def benchmark_generation_speed(model, prompt, tokenizer, device):
-    """Benchmarks tokens/sec for a model."""
     model.to(device)
     model.eval()
     input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
@@ -99,13 +96,13 @@ def benchmark_generation_speed(model, prompt, tokenizer, device):
         torch.cuda.synchronize()
         start, end = torch.cuda.Event(True), torch.cuda.Event(True)
         start.record()
-        _ = model.generate(input_ids, max_new_tokens=max_new_tokens, do_sample=False)
+        model.generate(input_ids, max_new_tokens=max_new_tokens, do_sample=False)
         end.record()
         torch.cuda.synchronize()
         elapsed = start.elapsed_time(end) / 1000.0
     else:
         t0 = time.time()
-        _ = model.generate(input_ids, max_new_tokens=max_new_tokens, do_sample=False)
+        model.generate(input_ids, max_new_tokens=max_new_tokens, do_sample=False)
         elapsed = time.time() - t0
 
     gen_tokens = max_new_tokens
@@ -116,9 +113,7 @@ def benchmark_generation_speed(model, prompt, tokenizer, device):
 # III.  Experiment
 # ================================================================
 if __name__ == "__main__":
-    
-    # --- 1. Argument Parser ---
-    parser = argparse.ArgumentParser(description="Evaluate pruning and SVD on a Hugging Face model.")
+    parser = argparse.ArgumentParser(description="Evaluate hardware optimizations on a Hugging Face model.")
     parser.add_argument(
         "--model_name",
         type=str,
@@ -127,7 +122,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    # --- 2. Device and Dtype Setup ---
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if torch.cuda.is_available():
         device = torch.device("cuda")
     elif torch.backends.mps.is_available():
@@ -135,39 +130,31 @@ if __name__ == "__main__":
         device = torch.device("mps")
     else:
         device = torch.device("cpu")
-    
-    # Set dtype based on device capabilities
     dtype = torch.bfloat16 if (device.type == "cuda" and torch.cuda.get_device_capability()[0] >= 8) else torch.float16
-    print(f"\nRunning Pruning + SVD Test on {args.model_name} on {device} ({dtype})")
+    print(f"\nRunning Gemma Pruning + SVD Test on {device} ({dtype})")
 
-    # --- 3. Load Tokenizer and Data ---
-    TOKENIZER = AutoTokenizer.from_pretrained(args.model_name, use_fast=False)
-    TOKENIZER.pad_token = TOKENIZER.eos_token
+    # Data
     test_loader = DataLoader(MockLLMDataset(TOKENIZER, size=80), batch_size=4)
 
-    # --- 4. Run Experiments ---
-    
     # 1️⃣ Baseline
     print("\n[1/3] Loading baseline model...")
-    base_model = load_model(args.model_name, dtype, device)
+    base_model = load_gemma_model(dtype, device)
     base_size = get_model_size_mb(base_model)
     base_ppl = evaluate_perplexity(base_model, test_loader, device)
     base_tps = benchmark_generation_speed(base_model, PROMPT, TOKENIZER, device)
-    del base_model # Free memory
 
     # 2️⃣ Pruned Model
     print("\n[2/3] Applying pruning...")
-    pruned_model = load_model(args.model_name, dtype, device)
+    pruned_model = load_gemma_model(dtype, device)
     pruner = Pruner(pruned_model)
     pruner.prune_magnitude_global(0.3)  # 30% global prune
     pruned_size = get_model_size_mb(pruned_model)
     pruned_ppl = evaluate_perplexity(pruned_model, test_loader, device)
     pruned_tps = benchmark_generation_speed(pruned_model, PROMPT, TOKENIZER, device)
-    del pruned_model # Free memory
 
     # 3️⃣ Pruned + SVD
     print("\n[3/3] Applying pruning + SVD decomposition...")
-    svd_model = load_model(args.model_name, dtype, device)
+    svd_model = load_gemma_model(dtype, device)
     svd_pruner = PrunerWithSVD(svd_model)
     svd_pruner.prune_magnitude_global(0.3)
     svd_pruner.apply_svd_on_masks(mode="reconstruct_dense", min_rank=4, inplace=True)
@@ -178,21 +165,18 @@ if __name__ == "__main__":
     # ================================================================
     # 4️⃣ Save final Pruned + SVD model state
     # ================================================================
-    
-    # Create a safe filename from the model name
-    safe_model_name = args.model_name.replace("/", "_")
-    OUTPUT_PATH = f"{safe_model_name}_pruned_svd_final.pth"
+    OUTPUT_PATH = "gemma_pruned_svd_final.pth"
 
     # Save the model's state_dict (weights) to a file
     torch.save(svd_model.state_dict(), OUTPUT_PATH)
     print(f"\n✅ Pruned + SVD model saved to: {OUTPUT_PATH}")
-    del svd_model # Free memory
+
 
     # ================================================================
     # IV.  Report
     # ================================================================
     print("\n" + "=" * 70)
-    print(f"{args.model_name.upper()} PRUNING + SVD COMPARISON REPORT") # Dynamic title
+    print("GEMMA PRUNING + SVD COMPARISON REPORT")
     print("=" * 70)
     print(f"| Metric | Baseline | Pruned (30%) | Pruned+SVD | Change vs Baseline |")
     print(f"|:--|--:|--:|--:|--:|")
