@@ -14,14 +14,6 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 
-# Critical: Set BEFORE any CUDA/torch operations
-os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "1"
-os.environ["NCCL_DEBUG"] = "WARN"
-# Optimize for B200s
-os.environ["NCCL_IB_DISABLE"] = "0"  # Enable InfiniBand
-os.environ["NCCL_P2P_LEVEL"] = "NVL"  # Use NVLink
-os.environ["NCCL_SOCKET_IFNAME"] = "eth0"  # Adjust to your interface
-
 os.environ["WANDB_START_METHOD"] = "thread"
 os.environ["WANDB_MODE"] = "online"
 os.environ["WANDB_CONSOLE"] = "off"
