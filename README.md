@@ -14,6 +14,6 @@ In order to get the proper results, here are the steps to follow:
 
 - For both Python commands, user has the option to include model of their choice to test pruning and quantization
   
-- **Reproducing recursive inference logic:
+- **Reproducing recursive inference logic:**
   - Run inference_testing.py
     - This code using Qwen3-8B as its main model and our custom 70M parameter model as the smaller model
