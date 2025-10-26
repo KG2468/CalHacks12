@@ -179,16 +179,6 @@ def benchmark_generation_speed(model: nn.Module, prompt_text: str, tokenizer, de
 
 if __name__ == "__main__":
     
-    # --- 1. Argument Parser ---
-    parser = argparse.ArgumentParser(description="Evaluate hardware optimizations on a Hugging Face model.")
-    parser.add_argument(
-        "--model_name",
-        type=str,
-        default="google/gemma-3-270m",
-        help="The Hugging Face model to evaluate (e.g., 'google/gemma-3-270m', 'mistralai/Mistral-7B-v0.1')."
-    )
-    args = parser.parse_args()
-    
     # --- 2. Setup (Device, Dtype, Paths, Tokenizer) ---
     
     # Device Setup
