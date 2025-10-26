@@ -75,6 +75,7 @@ def split_cot_into_groups(cot_steps: List[torch.Tensor], min_groups: int = 3, ma
         group_size = num_steps // num_groups
     
     # Create groups
+    print("group_size: ", group_size)
     groups = []
     for i in range(0, num_steps, group_size):
         group = cot_steps[i:i + group_size]
