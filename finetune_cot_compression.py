@@ -193,6 +193,7 @@ def train_epoch(small_model, large_model, large_tokenizer, train_loader, optimiz
     for batch_idx, batch in enumerate(train_loader):
         for i in range(BATCH_SIZE):
             print("batch_idx: ", batch_idx)
+            print("BATCH_SIZE: ", BATCH_SIZE)
             # print("i: ", i)
             system_prompt = batch['system_prompt'][i]
             prompt = batch['prompt'][i]
