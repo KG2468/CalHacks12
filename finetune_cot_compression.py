@@ -28,7 +28,7 @@ SMALL_N_EMBD = 512
 SMALL_DROPOUT = 0.1
 
 # Training hyperparameters
-BATCH_SIZE = 1  # Process one example at a time due to complex logic
+BATCH_SIZE = 32  # Process one example at a time due to complex logic
 LEARNING_RATE = 4e-4
 NUM_EPOCHS = 3
 LOG_INTERVAL = 10
