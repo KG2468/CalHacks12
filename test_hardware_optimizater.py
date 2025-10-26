@@ -199,23 +199,23 @@ if __name__ == "__main__":
         TARGET_DTYPE = torch.float32 # CPU must use float32
 
     # Dynamic Paths
-    safe_model_name = args.model_name.replace("/", "_")
+    # safe_model_name = args.model_name.replace("/", "_")
     PRUNED_SVD_PATH = f"{safe_model_name}_pruned_svd_final.pth"
     OUTPUT_PATH = f"{safe_model_name}_quantized_final.pth"
 
     # Tokenizer Setup
-    GLOBAL_TOKENIZER = AutoTokenizer.from_pretrained(args.model_name)
+    GLOBAL_TOKENIZER = AutoTokenizer.from_pretrained(MODEL_NAME)
     GLOBAL_TOKENIZER.pad_token = GLOBAL_TOKENIZER.eos_token
 
     
     print("\n" + "="*70)
-    print(f"TESTING {args.model_name.upper()} OPTIMIZATION | TARGET DEVICE: {TARGET_DEVICE.type.upper()} ({TARGET_DTYPE})")
+    print(f"TESTING {MODEL_NAME.upper()} OPTIMIZATION | TARGET DEVICE: {TARGET_DEVICE.type.upper()} ({TARGET_DTYPE})")
     print("="*70)
 
     # --- 3. Load Baseline Model ---
     print("\n[1/4] Loading Baseline Model...")
     # Load FP32 model, then cast to the optimal mixed precision dtype (BF16/FP16)
-    fp32_model = load_model(args.model_name, torch.float32, TARGET_DEVICE).to(TARGET_DTYPE) 
+    fp32_model = load_model(MODEL_NAME, torch.float32, TARGET_DEVICE).to(TARGET_DTYPE) 
 
     # (Optional: Load pre-optimized model for comparison)
     # print(f"\n[0] Loading Pruned+SVD model weights from {PRUNED_SVD_PATH}...")
@@ -244,7 +244,7 @@ if __name__ == "__main__":
     print("\n[2/4] Applying Hardware Optimization (Mixed Precision + Pruning)...")
     
     # A. Create a clean copy of the model for optimization
-    optimized_model = load_model(args.model_name, torch.float32, TARGET_DEVICE)
+    optimized_model = load_model(MODEL_NAME, torch.float32, TARGET_DEVICE)
     
     # B. Initialize optimizer and apply the pipeline
     # The example input should match the device/dtype the model expects for tracing
@@ -276,7 +276,7 @@ if __name__ == "__main__":
 
     # --- 6. Final Comparison Report ---
     print("\n" + "="*70)
-    print(f"FINAL {args.model_name.upper()} OPTIMIZATION REPORT (Pruning + Mixed Precision)")
+    print(f"FINAL {MODEL_NAME.upper()} OPTIMIZATION REPORT (Pruning + Mixed Precision)")
     print("="*70)
     
     # Calculate metrics
