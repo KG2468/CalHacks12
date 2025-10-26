@@ -109,7 +109,7 @@ def cleanup():
 # --- 3. Evaluation Function ---
 @torch.no_grad()
 def evaluate(model, val_loader, loss_fn, device, rank):
-    """Calculates average validation loss - similar to reference code pattern."""
+    """Calculates average validation loss."""
     model.eval()
     
     score = torch.tensor(0.0, device=device)
@@ -133,7 +133,7 @@ def evaluate(model, val_loader, loss_fn, device, rank):
                 print(f"Error during evaluation: {e}", flush=True)
             break
     
-    # Reduce across all GPUs - like in reference code
+    # Reduce across all GPUs
     dist.all_reduce(score, op=dist.ReduceOp.SUM)
     dist.all_reduce(n_samples, op=dist.ReduceOp.SUM)
     
@@ -145,7 +145,7 @@ def evaluate(model, val_loader, loss_fn, device, rank):
 
 # --- 4. Main Training Script ---
 def main():
-    # Setup DDP - following reference code pattern
+    # Setup DDP
     assert torch.cuda.is_available(), "Training requires at least one GPU."
     dist.init_process_group(backend='nccl', init_method='env://')
     
@@ -204,7 +204,7 @@ def main():
         steps_per_epoch = total_tokens // effective_batch_size
         print(f"Steps per epoch (approx): {steps_per_epoch:,}")
     
-    # Create Samplers - following reference pattern
+    # Create Samplers
     train_sampler = DistributedSampler(
         train_data,
         num_replicas=world_size,
@@ -226,7 +226,7 @@ def main():
         batch_size=CONFIG['batch_size'],
         shuffle=False,
         sampler=train_sampler,
-        num_workers=12,  # INCREASED for 8 GPUs (was 4)
+        num_workers=12,  # INCREASED for 8 GPUs
         pin_memory=True,
         drop_last=True,
         prefetch_factor=4,  # Prefetch more batches
@@ -238,7 +238,7 @@ def main():
         batch_size=CONFIG['batch_size'],
         shuffle=False,
         sampler=val_sampler,
-        num_workers=12,  # INCREASED for 8 GPUs
+        num_workers=12,
         pin_memory=True,
         drop_last=True,
         prefetch_factor=4,
@@ -265,7 +265,7 @@ def main():
         param_count = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6
         print(f"Model parameters: {param_count:.2f}M")
     
-    # Wrap with DDP - following reference pattern
+    # Wrap with DDP
     model = DDP(model, device_ids=[device])
     
     if rank == 0:
@@ -279,14 +279,14 @@ def main():
         model.parameters(), 
         lr=CONFIG['learning_rate'], 
         weight_decay=0,
-        fused=True  # Fused optimizer for B200s - MUCH faster
+        fused=True  # Fused optimizer for B200s
     )
     loss_fn = nn.CrossEntropyLoss()
     
     # Setup gradient scaler for mixed precision
     scaler = torch.cuda.amp.GradScaler(enabled=CONFIG['use_amp'])
     
-    # Training Loop - following reference code structure
+    # Training Loop
     if rank == 0:
         print("\nStarting training...")
         print("="*70)
@@ -309,25 +309,22 @@ def main():
                 x = x.to(device, non_blocking=True)
                 y = y.to(device, non_blocking=True)
                 
-                # ===== BF16 AUTOCAST WRAPS FORWARD PASS =====
+                # BF16 autocast for forward pass
                 with torch.amp.autocast('cuda', enabled=CONFIG['use_amp'], dtype=torch.bfloat16):
-                    # Forward pass inside autocast
                     logits, _ = model(x, past_kv_caches=None)
                     loss = loss_fn(logits.view(-1, CONFIG['vocab_size']), y.view(-1))
-                # ===== END AUTOCAST =====
                 
-                # ===== GRADIENT SCALING FOR BACKWARD =====
+                # Backward pass with gradient scaling
                 optimizer.zero_grad(set_to_none=True)
-                scaler.scale(loss).backward()  # Scale loss before backward
+                scaler.scale(loss).backward()
                 
                 # Unscale gradients before clipping
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 
-                # Step optimizer with scaled gradients
+                # Step optimizer
                 scaler.step(optimizer)
-                scaler.update()  # Update scaler for next iteration
-                # ===== END GRADIENT SCALING =====
+                scaler.update()
                 
                 # Accumulate loss
                 running_loss += loss.item()
@@ -336,12 +333,11 @@ def main():
                 
                 # Logging
                 if train_steps % CONFIG['log_interval'] == 0:
-                    # Synchronize for accurate timing
                     torch.cuda.synchronize()
                     end_time = time.time()
                     steps_per_sec = log_steps / (end_time - start_time)
                     
-                    # Reduce loss across all processes - like reference code
+                    # Reduce loss across all processes
                     avg_loss = torch.tensor(running_loss / log_steps, device=device)
                     dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
                     avg_loss = avg_loss.item() / world_size
@@ -371,7 +367,7 @@ def main():
                     
                     val_loss = evaluate(model, val_loader, loss_fn, device, rank)
                     
-                    # Synchronize after evaluation - like reference code
+                    # Synchronize after evaluation
                     dist.barrier()
                     
                     eval_time = time.time() - eval_start_time
@@ -391,105 +387,7 @@ def main():
                             pass
                     
                     model.train()
-                    start_time = time.time()  # Reset timer after eval
-            
-            # End of epoch
-            if rank == 0:
-                print(f"\nEpoch {epoch+1} complete\n")
-                
-                # Save checkpoint
-                try:
-                    ckpt_dir = "checkpoints"
-                    os.makedirs(ckpt_dir, exist_ok=True)
-                    ckpt_path = os.path.join(ckpt_dir, f"model_epoch_{epoch+1}.pt")
-                    
-                    # Unwrap DDP model for saving
-                    model_to_save = model.module if hasattr(model, 'module') else model
-                    
-                    torch.save({
-                        'epoch': epoch + 1,
-                        'train_steps': train_steps,
-                        'model_state_dict': model_to_save.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'config': model_config
-                    }, ckpt_path)
-                    print(f"Checkpoint saved: {ckpt_path}")
-                    
-                    try:
-                        wandb.save(ckpt_path)
-                    except:
-                        pass
-                except Exception as e:
-                    print(f"Error saving checkpoint: {e}", flush=True)
-        
-        if rank == 0:
-            print("\n" + "="*70)
-            print("Training completed!")
-            print("="*70)
-                
-                # Accumulate loss
-                running_loss += loss.item()
-                log_steps += 1
-                train_steps += 1
-                
-                # Logging
-                if train_steps % CONFIG['log_interval'] == 0:
-                    # Synchronize for accurate timing
-                    torch.cuda.synchronize()
-                    end_time = time.time()
-                    steps_per_sec = log_steps / (end_time - start_time)
-                    
-                    # Reduce loss across all processes - like reference code
-                    avg_loss = torch.tensor(running_loss / log_steps, device=device)
-                    dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
-                    avg_loss = avg_loss.item() / world_size
-                    
-                    if rank == 0:
-                        print(f"Step {train_steps:6d} | Loss: {avg_loss:.4f} | Steps/Sec: {steps_per_sec:.2f}", flush=True)
-                        
-                        try:
-                            wandb.log({
-                                "step": train_steps,
-                                "epoch": epoch + 1,
-                                "train_loss": avg_loss,
-                                "steps_per_sec": steps_per_sec,
-                                "learning_rate": optimizer.param_groups[0]['lr']
-                            })
-                        except:
-                            pass
-                    
-                    # Reset monitoring variables
-                    running_loss = 0
-                    log_steps = 0
                     start_time = time.time()
-                
-                # Evaluation
-                if train_steps % CONFIG['eval_interval'] == 0 and train_steps > 0:
-                    eval_start_time = time.time()
-                    
-                    val_loss = evaluate(model, val_loader, loss_fn, device, rank)
-                    
-                    # Synchronize after evaluation - like reference code
-                    dist.barrier()
-                    
-                    eval_time = time.time() - eval_start_time
-                    
-                    if rank == 0:
-                        print(f"\nValidation at Step {train_steps}")
-                        print(f"Val Loss: {val_loss:.4f} | Eval Time: {eval_time:.2f}s\n", flush=True)
-                        
-                        try:
-                            wandb.log({
-                                "step": train_steps,
-                                "epoch": epoch + 1,
-                                "val_loss": val_loss,
-                                "eval_time": eval_time
-                            })
-                        except:
-                            pass
-                    
-                    model.train()
-                    start_time = time.time()  # Reset timer after eval
             
             # End of epoch
             if rank == 0:
