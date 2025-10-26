@@ -222,7 +222,7 @@ def main():
         batch_size=CONFIG['batch_size'],
         shuffle=False,
         sampler=train_sampler,
-        num_workers=12,  # INCREASED for 8 GPUs
+        num_workers=4,  # INCREASED for 8 GPUs
         pin_memory=True,
         drop_last=True,
         prefetch_factor=4,  # Prefetch more batches
