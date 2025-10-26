@@ -192,6 +192,8 @@ def train_epoch(small_model, large_model, large_tokenizer, train_loader, optimiz
     
     for batch_idx, batch in enumerate(train_loader):
         for i in range(BATCH_SIZE):
+            print("batch_idx: ", batch_idx)
+            print("i: ", i)
             system_prompt = batch['system_prompt'][i]
             prompt = batch['prompt'][i]
             cot_steps = batch['cot_steps'][i]  # List of tensors
