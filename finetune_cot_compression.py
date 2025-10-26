@@ -37,7 +37,7 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 LARGE_MODEL_NAME = "Qwen/Qwen3-8B"  # You can change this to any larger model
 
 # Loss weights
-TOKEN_LENGTH_WEIGHT = 0.01  # Weight for token length penalty
+TOKEN_LENGTH_WEIGHT = 1  # Weight for token length penalty
 
 # Tokenizer
 TOKENIZER_NAME = "EleutherAI/gpt-neo-125M"
@@ -149,7 +149,7 @@ class StructuredCoTDataset(Dataset):
         # Structure: [prompt, cot1, cot2, ..., final_answer]
         self.examples = []
         for ex in data['examples']:
-            print(ex.shape)
+            
             # ex has: [prompt, cot_step1, cot_step2, ..., final_answer]
             # We need at least: prompt + 3 cot steps + final answer = 5 elements minimum
             if len(ex) >= 5:  # prompt + at least 3 CoT + final
@@ -300,7 +300,8 @@ def train_epoch(small_model, large_model, large_tokenizer, train_loader, optimiz
                 ce_loss = -(selected_log_probs * reward.detach()).mean()
                 
                 # Length penalty (encourage shorter outputs)
-                length_penalty = max(compressed_length - 7*full_input.shape[1] // 8, 0) * TOKEN_LENGTH_WEIGHT #Hard coded 7/8 compression factor
+                ideal_length = 7 * full_input.shape[1] // 8  # Hard coded 7/8 compression factor
+                length_penalty = (max(compressed_length - ideal_length, 0) / ideal_length) * TOKEN_LENGTH_WEIGHT #Hard coded 7/8 compression factor
 
                 group_loss = ce_loss + length_penalty
                 batch_loss += group_loss
