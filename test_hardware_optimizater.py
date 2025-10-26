@@ -16,10 +16,14 @@ import torch.nn.functional as F
 # --- External Optimizer Import ---
 try:
     from hardware_optimizer import HardwareOptimizer 
+    from pruner import Pruner
 except ImportError:
     print("FATAL ERROR: Could not import HardwareOptimizer.")
     print("Please ensure 'hardware_optimizer.py' is in the same directory.")
     exit()
+
+# In test_hardware_optimizer.py (near the top)
+
 # -----------------------------
 
 # ==============================================================================
@@ -115,10 +119,17 @@ def evaluate_perplexity(model: nn.Module, data_loader: DataLoader, device: torch
     
     return perplexity
 
+# In test_hardware_optimizer.py, replace the existing benchmark_generation_speed function
+
+# In test_hardware_optimizer.py, replace the existing benchmark_generation_speed function
+
 def benchmark_generation_speed(model: nn.Module, prompt_text: str, tokenizer, device: torch.device) -> float:
-    """Measures generation speed in Tokens Per Second (TPS)."""
+    """
+    Measures generation speed in Tokens Per Second (TPS). 
+    Handles both CUDA and CPU devices for timing.
+    """
     model.eval()
-    model.to(device) # Ensure model is on device
+    model.to(device)
     
     # Encode the prompt
     input_ids = tokenizer(prompt_text, return_tensors="pt").input_ids.to(device)
@@ -126,31 +137,54 @@ def benchmark_generation_speed(model: nn.Module, prompt_text: str, tokenizer, de
     num_return_sequences = 1
     max_new_tokens = 50
     
-    # Warm-up run (crucial)
+    # --- WARMUP (CRUCIAL) ---
+    # Warm-up run doesn't need timing, but needs synchronization if on CUDA
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        
     with torch.no_grad():
         model.generate(input_ids, max_new_tokens=10, num_return_sequences=num_return_sequences, do_sample=False)
     
-    start_time = time.time()
+    # --- MAIN BENCHMARK RUN ---
     
-    # Main benchmark run
-    with torch.no_grad():
-        output_sequences = model.generate(
-            input_ids,
-            max_new_tokens=max_new_tokens,
-            num_return_sequences=num_return_sequences,
-            do_sample=False, # Use deterministic decoding
-            pad_token_id=tokenizer.eos_token_id
-        )
-    
-    end_time = time.time()
+    if device.type == 'cuda':
+        # GPU timing using CUDA Events
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        
+        with torch.no_grad():
+            start_event.record()
+            output_sequences = model.generate(
+                input_ids, max_new_tokens=max_new_tokens, num_return_sequences=num_return_sequences,
+                do_sample=False, pad_token_id=tokenizer.eos_token_id
+            )
+            end_event.record()
+        
+        torch.cuda.synchronize()
+        elapsed_time = start_event.elapsed_time(end_event) / 1000.0 # Time in seconds
+        
+    else:
+        # CPU timing using standard time library
+        start_time = time.time()
+        with torch.no_grad():
+            output_sequences = model.generate(
+                input_ids, max_new_tokens=max_new_tokens, num_return_sequences=num_return_sequences,
+                do_sample=False, pad_token_id=tokenizer.eos_token_id
+            )
+        elapsed_time = time.time() - start_time
+        
+    # --- RESULTS CALCULATION ---
     
     # Calculate tokens generated (output length minus input length)
     total_generated_tokens = (output_sequences.size(1) - input_ids.size(1)) * num_return_sequences
     
-    speed_tps = total_generated_tokens / (end_time - start_time)
+    # Speed is tokens per second (TPS)
+    speed_tps = total_generated_tokens / elapsed_time
     
     return speed_tps
-
 # ==============================================================================
 # III. Execution and Reporting
 # ==============================================================================
@@ -203,7 +237,7 @@ if __name__ == "__main__":
     optimized_model = optimizer.apply_mixed_precision()
     
     # 2. Apply Structural Pruning
-    optimized_model = optimizer.prune_model(amount=0.1, granularity='channel')
+    #optimized_model = optimizer.prune_model(amount=0.1, granularity='channel')
     
     # 3. No INT8 quantization is applied here, as it's typically CPU-only or requires TensorRT.
 
