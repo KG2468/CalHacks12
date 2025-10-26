@@ -218,7 +218,8 @@ def train_epoch(small_model, large_model, large_tokenizer, train_loader, optimiz
             for group_idx in range(len(cot_groups) - 1):
                 current_group = cot_groups[group_idx]
                 next_group = cot_groups[group_idx + 1]
-                
+                if len(current_group) <= 1:
+                    continue
                 # Add current group to input
                 current_group_tokens = torch.cat(current_group, dim=0).unsqueeze(0).to(device)
                 full_input = torch.cat([current_input, current_group_tokens], dim=1)
