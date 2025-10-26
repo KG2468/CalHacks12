@@ -70,9 +70,11 @@ def split_cot_into_groups(cot_steps: List[torch.Tensor], min_groups: int = 3, ma
     
     # If we need more groups than min_groups, that's fine
     # Otherwise, try to balance the groups
-    if num_groups < min_groups:
-        num_groups = min_groups
-        group_size = num_steps // num_groups
+    # if num_groups < min_groups:
+    #     num_groups = min_groups
+    #     group_size = num_steps // num_groups
+    group_size = 5
+    num_groups = num_steps // group_size
     
     # Create groups
     print("group_size: ", group_size)
