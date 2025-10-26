@@ -39,7 +39,7 @@ CONFIG = {
     "n_embd": 512,
     "ff_hidden": 512 * 4,
     "dropout": 0.1,
-    "batch_size": 128,  # INCREASED for B200s (192GB memory)
+    "batch_size": 32,  # INCREASED for B200s (192GB memory)
     "learning_rate": 2e-4,
     "num_epochs": 5,
     "eval_interval": 500,
