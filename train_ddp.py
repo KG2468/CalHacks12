@@ -44,6 +44,7 @@ CONFIG = {
     "num_epochs": 5,
     "eval_interval": 500,
     "log_interval": 10,
+    "checkpoint_interval": 1000,  # <-- ADDED THIS
     "device": 'cuda',
     "tokenizer_name": 'EleutherAI/gpt-neo-125M',
     "use_amp": True,  # Use BF16 mixed precision
@@ -116,8 +117,10 @@ def evaluate(model, val_loader, loss_fn, device, rank):
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         
         try:
+            # Get the vocab_size from the unwrapped model
+            vocab_size = model.module.vocab_size if hasattr(model, 'module') else model.vocab_size
             logits, _ = model(x, past_kv_caches=None)
-            loss = loss_fn(logits.view(-1, model.vocab_size), y.view(-1))
+            loss = loss_fn(logits.view(-1, vocab_size), y.view(-1))
             score += loss
             n_samples += 1
         except Exception as e:
@@ -191,11 +194,12 @@ def main():
     
     if rank == 0:
         print(f"Train sequences: {len(train_data):,}, Val sequences: {len(val_data):,}")
-        total_tokens = 1_400_000_000
-        effective_batch_size = CONFIG['batch_size'] * world_size
-        steps_per_epoch = total_tokens // effective_batch_size
-        print(f"Steps per epoch (approx): {steps_per_epoch:,}")
-    
+        # --- This calculation seems off, let's use len(train_loader) ---
+        # total_tokens = 1_400_000_000 
+        # effective_batch_size = CONFIG['batch_size'] * world_size
+        # steps_per_epoch = total_tokens // effective_batch_size
+        # print(f"Steps per epoch (approx): {steps_per_epoch:,}")
+        
     # Create Samplers
     train_sampler = DistributedSampler(
         train_data,
@@ -218,7 +222,7 @@ def main():
         batch_size=CONFIG['batch_size'],
         shuffle=False,
         sampler=train_sampler,
-        num_workers=12,  # INCREASED for 8 GPUs
+        num_workers=4,  # INCREASED for 8 GPUs
         pin_memory=True,
         drop_last=True,
         prefetch_factor=4,  # Prefetch more batches
@@ -237,6 +241,10 @@ def main():
         persistent_workers=True
     )
     
+    if rank == 0:
+        steps_per_epoch = len(train_loader)
+        print(f"Steps per epoch (from DataLoader): {steps_per_epoch:,}")
+        
     # Init Model
     if rank == 0:
         print("Initializing model...")
@@ -380,35 +388,43 @@ def main():
                     
                     model.train()
                     start_time = time.time()
+
+                # --- CHECKPOINTING MODIFICATION ---
+                if train_steps % CONFIG['checkpoint_interval'] == 0 and train_steps > 0:
+                    # Save checkpoint only on rank 0
+                    if rank == 0:
+                        try:
+                            ckpt_dir = "checkpoints"
+                            os.makedirs(ckpt_dir, exist_ok=True)
+                            # Change filename to use step
+                            ckpt_path = os.path.join(ckpt_dir, f"model_step_{train_steps}.pt")
+                            
+                            # Unwrap DDP model for saving
+                            model_to_save = model.module if hasattr(model, 'module') else model
+                            
+                            torch.save({
+                                'epoch': epoch + 1,
+                                'train_steps': train_steps,
+                                'model_state_dict': model_to_save.state_dict(),
+                                'optimizer_state_dict': optimizer.state_dict(),
+                                'scaler_state_dict': scaler.state_dict(), # Also save scaler state
+                                'config': model_config
+                            }, ckpt_path)
+                            print(f"\n[Checkpoint] Saved at step {train_steps}: {ckpt_path}\n", flush=True)
+                            
+                            try:
+                                wandb.save(ckpt_path)
+                            except:
+                                pass
+                        except Exception as e:
+                            print(f"Error saving checkpoint at step {train_steps}: {e}", flush=True)
+                # --- END MODIFICATION ---
             
             # End of epoch
             if rank == 0:
                 print(f"\nEpoch {epoch+1} complete\n")
                 
-                # Save checkpoint
-                try:
-                    ckpt_dir = "checkpoints"
-                    os.makedirs(ckpt_dir, exist_ok=True)
-                    ckpt_path = os.path.join(ckpt_dir, f"model_epoch_{epoch+1}.pt")
-                    
-                    # Unwrap DDP model for saving
-                    model_to_save = model.module if hasattr(model, 'module') else model
-                    
-                    torch.save({
-                        'epoch': epoch + 1,
-                        'train_steps': train_steps,
-                        'model_state_dict': model_to_save.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'config': model_config
-                    }, ckpt_path)
-                    print(f"Checkpoint saved: {ckpt_path}")
-                    
-                    try:
-                        wandb.save(ckpt_path)
-                    except:
-                        pass
-                except Exception as e:
-                    print(f"Error saving checkpoint: {e}", flush=True)
+                # --- REMOVED EPOCH CHECKPOINTING LOGIC FROM HERE ---
         
         if rank == 0:
             print("\n" + "="*70)
