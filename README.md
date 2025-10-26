@@ -1,5 +1,8 @@
 # CalHacks12
 
+Here is our write of our project with more technical details of the various parts of the project:
+file:///Users/rithwiknukala/Downloads/CalHacks_WriteUp.pdf
+
 ## Reproducing Results
 
 In order to get the proper results, here are the steps to follow:
