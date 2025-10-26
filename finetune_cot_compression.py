@@ -41,6 +41,8 @@ TOKEN_LENGTH_WEIGHT = 0.01  # Weight for token length penalty
 
 # Tokenizer
 TOKENIZER_NAME = "EleutherAI/gpt-neo-125M"
+LARGE_TOKENIZER_NAME = "Qwen/Qwen3-8B"
+LARGE_MODEL_NAME = "Qwen/Qwen3-8B"
 
 # --- 2. Helper Functions ---
 def split_cot_into_groups(cot_steps: List[torch.Tensor], min_groups: int = 3, max_group_size: int = 5) -> List[List[torch.Tensor]]:
