@@ -30,10 +30,10 @@ except ImportError:
 # No changes here, keep your CONFIG dict as is
 CONFIG = {
     "vocab_size": 50257,
-    "block_size": 4096,
+    "block_size": 2048,
     "n_layer": 6,
-    "n_head": 10,
-    "n_embd": 640,
+    "n_head": 8,
+    "n_embd": 512,
     "ff_hidden": 512 * 4,
     "dropout": 0.1,
     "batch_size": 32, # This will be batch size PER GPU
