@@ -4,10 +4,16 @@
 
 In order to get the proper results, here are the steps to follow:
 
-- **To get the quantization then pruning results**, run the programs in this order:
+- **Reproducing quantization then pruning results**, run the programs in this order:
   - `python3 test_hardware_optimizater.py`
   - `python3 test_pruning.py`
 
-- **To get the pruning then quantization results**, run the programs in this order:
+- **Reproducing pruning then quantization results**, run programs in the following order:
   - `python3 test_hardware_optimizater.py`
   - `python3 test_pruning.py`
+
+- For both Python commands, user has the option to include model of their choice to test pruning and quantization
+  
+- **Reproducing recursive inference logic:
+  - Run inference_testing.py
+    - This code using Qwen3-8B as its main model and our custom 70M parameter model as the smaller model
