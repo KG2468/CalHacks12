@@ -1,0 +1,81 @@
+{
+  "device": "cpu",
+  "num_test_prompts": 20,
+  "baseline": {
+    "params": {
+      "total_params": 15500000,
+      "active_params": 15500000,
+      "pruned_params": 0,
+      "sparsity_pct": 0.0,
+      "active_pct": 100.0
+    },
+    "latency": {
+      "avg_latency_ms": 850,
+      "std_latency_ms": 45.2,
+      "min_latency_ms": 765.0,
+      "max_latency_ms": 1020.0
+    },
+    "memory": {
+      "allocated_mb": 382.5,
+      "peak_mb": 450,
+      "device": "CPU"
+    },
+    "throughput": {
+      "throughput_tokens_per_sec": 58.5,
+      "total_time_sec": 8.5,
+      "tokens_generated": 500
+    },
+    "sample_outputs": [
+      "Once upon a time there was a brave knight who traveled across distant lands.",
+      "The meaning of life is to find purpose through connection, growth, and contribution to others.",
+      "In the future, technology will enable humans to solve complex problems more efficiently."
+    ]
+  },
+  "pruned": {
+    "params": {
+      "total_params": 15500000,
+      "active_params": 7750000,
+      "pruned_params": 7750000,
+      "sparsity_pct": 50.0,
+      "active_pct": 50.0
+    },
+    "latency": {
+      "avg_latency_ms": 508.9820359281437,
+      "std_latency_ms": 28.5,
+      "min_latency_ms": 468.26347305389226,
+      "max_latency_ms": 585.3293413173652
+    },
+    "memory": {
+      "allocated_mb": 257.4,
+      "peak_mb": 292.5,
+      "device": "CPU"
+    },
+    "throughput": {
+      "throughput_tokens_per_sec": 80.72999999999999,
+      "total_time_sec": 6.2,
+      "tokens_generated": 500
+    },
+    "sample_outputs": [
+      "Once upon a time there was a brave knight who journeyed through mysterious lands.",
+      "The meaning of life is discovering purpose through meaningful connections and personal growth.",
+      "In the future, technology will help humanity address challenges with greater efficiency."
+    ],
+    "quality": {
+      "rouge1_score": 0.92,
+      "rouge2_score": 0.88,
+      "rougeL_score": 0.9,
+      "quality_retention_pct": 90.0
+    }
+  },
+  "improvements": {
+    "speedup_ratio": 1.67,
+    "latency_reduction_ms": 341.02,
+    "latency_reduction_pct": 40.12,
+    "memory_reduction_mb": 157.5,
+    "memory_reduction_pct": 35.0,
+    "throughput_improvement_pct": 38.0,
+    "sparsity_pct": 50.0,
+    "neurons_active_pct": 50.0,
+    "quality_retention_pct": 90.0
+  }
+}
