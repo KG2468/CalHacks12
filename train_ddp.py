@@ -7,52 +7,49 @@ import time
 import numpy as np
 import os
 import wandb
-import sys
+import argparse # <-- Add argparse for potential command-line args
 
 # --- DDP Imports ---
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
+# --------------------
 
 os.environ["WANDB_START_METHOD"] = "thread"
-os.environ["WANDB_MODE"] = "online"
-os.environ["WANDB_CONSOLE"] = "off"
-
-# Enable TF32 for B200s - CRITICAL for performance
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-torch.set_float32_matmul_precision('high')
+os.environ["WANDB_MODE"] = "online"       # ensure online sync
+os.environ["WANDB_CONSOLE"] = "off"       # prevent stdout blocking
 
 # --- Import your model ---
 try:
     from attention import SimpleAttentionLM
 except ImportError:
     print("Error: Could not import SimpleAttentionLM from attention.py")
-    sys.exit(1)
+    exit()
 
 # --- 1. Config ---
 CONFIG = {
     "vocab_size": 50257,
-    "block_size": 4096,
+    "block_size": 2048,
     "n_layer": 6,
     "n_head": 8,
     "n_embd": 512,
     "ff_hidden": 512 * 4,
     "dropout": 0.1,
-    "batch_size": 32,  # INCREASED for B200s (192GB memory)
+    "batch_size": 32, # This will be batch size PER GPU
     "learning_rate": 2e-4,
     "num_epochs": 5,
-    "eval_interval": 500,
+    "eval_interval": 100,
     "log_interval": 10,
-    "checkpoint_interval": 1000,  # <-- ADDED THIS
-    "device": 'cuda',
-    "tokenizer_name": 'EleutherAI/gpt-neo-125M',
-    "use_amp": True,  # Use BF16 mixed precision
+    "save_interval": 200, # <-- ADDED: Save checkpoint every N steps
+    "device": 'cuda', # We'll determine the specific GPU later
+    "tokenizer_name": 'EleutherAI/gpt-neo-125M'
 }
 
-# --- 2. Data Pipeline ---
+# --- 2. Data Pipeline (MmapDataset) ---
+# (MmapTrainDataset and MmapValDataset classes are unchanged)
 class MmapTrainDataset(Dataset):
     def __init__(self, bin_file_path, block_size, train_split=0.9, dtype=np.uint16):
+        # ... (implementation as before) ...
         super().__init__()
         self.block_size = block_size
         self.dtype = dtype
@@ -60,6 +57,7 @@ class MmapTrainDataset(Dataset):
         item_size = np.dtype(self.dtype).itemsize
         self.num_tokens = file_size_bytes // item_size
         self.split_idx = int(self.num_tokens * train_split)
+        print(f"Memory-mapping {bin_file_path} ({self.num_tokens:,} tokens)")
         self.mmap = np.memmap(bin_file_path, dtype=self.dtype, mode='r')
 
     def __len__(self):
@@ -73,6 +71,7 @@ class MmapTrainDataset(Dataset):
 
 class MmapValDataset(Dataset):
     def __init__(self, bin_file_path, block_size, train_split=0.9, dtype=np.uint16):
+        # ... (implementation as before) ...
         super().__init__()
         self.block_size = block_size
         self.dtype = dtype
@@ -80,6 +79,9 @@ class MmapValDataset(Dataset):
         item_size = np.dtype(self.dtype).itemsize
         self.num_tokens = file_size_bytes // item_size
         self.split_idx = int(self.num_tokens * train_split)
+        # Re-map only if needed, or share the map if possible (advanced)
+        # For simplicity, we re-map here
+        # print(f"Memory-mapping {bin_file_path} for validation")
         self.mmap = np.memmap(bin_file_path, dtype=self.dtype, mode='r')
 
     def __len__(self):
@@ -93,163 +95,141 @@ class MmapValDataset(Dataset):
         return x, y
 
 
-def cleanup():
-    """End DDP training."""
+# --- DDP Setup Function ---
+def setup_ddp():
+    """Initializes the distributed environment."""
+    if dist.is_available() and torch.cuda.is_available() and torch.cuda.device_count() > 0:
+        dist.init_process_group(backend='nccl') # NCCL is recommended for NVIDIA GPUs
+        local_rank = int(os.environ['LOCAL_RANK'])
+        torch.cuda.set_device(local_rank)
+        print(f"Rank {dist.get_rank()} initialized on GPU {local_rank}")
+        return True, dist.get_rank(), dist.get_world_size(), local_rank
+    else:
+        print("DDP not available or no GPUs found. Running in single-process mode.")
+        return False, 0, 1, 0 # rank, world_size, local_rank for non-DDP
+
+def cleanup_ddp():
+    """Cleans up the distributed environment."""
     if dist.is_initialized():
         dist.destroy_process_group()
+# -------------------------
 
 
-# --- 3. Evaluation Function ---
+# --- 3. Training & Evaluation Functions ---
 @torch.no_grad()
-def evaluate(model, val_loader, loss_fn, device, rank):
+def evaluate(model, val_loader, loss_fn, device, is_ddp): # <-- Added device, is_ddp
     """Calculates average validation loss."""
-    model.eval()
-    
-    score = torch.tensor(0.0, device=device)
-    n_samples = torch.tensor(0, device=device)
-    
-    num_eval_batches = min(100, len(val_loader))
-    
-    for k, (x, y) in enumerate(val_loader):
-        if k >= num_eval_batches:
-            break
-        
-        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-        
+    # If using DDP, model is already wrapped. Access original model via model.module
+    eval_model = model.module if is_ddp else model
+    eval_model.eval()
+    losses = []
+    val_iter = iter(val_loader)
+    num_eval_batches = 100 # Evaluate on 100 batches per process
+
+    for k in range(num_eval_batches):
         try:
-            # Get the vocab_size from the unwrapped model
-            vocab_size = model.module.vocab_size if hasattr(model, 'module') else model.vocab_size
-            logits, _ = model(x, past_kv_caches=None)
-            loss = loss_fn(logits.view(-1, vocab_size), y.view(-1))
-            score += loss
-            n_samples += 1
-        except Exception as e:
-            if rank == 0:
-                print(f"Error during evaluation: {e}", flush=True)
+            x, y = next(val_iter)
+        except StopIteration:
             break
-    
-    # Reduce across all GPUs
-    dist.all_reduce(score, op=dist.ReduceOp.SUM)
-    dist.all_reduce(n_samples, op=dist.ReduceOp.SUM)
-    
-    avg_loss = (score / n_samples).item() if n_samples > 0 else 0.0
-    
-    model.train()
+        x, y = x.to(device), y.to(device) # <-- Use assigned device
+        logits, _ = eval_model(x, past_kv_caches=None) # <-- Use eval_model
+        loss = loss_fn(logits.view(-
+                    1, eval_model.vocab_size), y.view(-1)) # <-- Use eval_model
+        losses.append(loss.item())
+
+    eval_model.train() # Set model back to training mode
+
+    if not losses:
+        return 0.0
+
+    # --- Aggregate losses across all GPUs ---
+    avg_loss = torch.tensor(losses).mean().item()
+    if is_ddp:
+        # Need to gather losses from all ranks
+        loss_tensor = torch.tensor(avg_loss, device=device)
+        dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
+        avg_loss = loss_tensor.item()
+    # ------------------------------------------
+
     return avg_loss
 
-
 # --- 4. Main Training Script ---
-def main():
-    # Setup DDP
-    assert torch.cuda.is_available(), "Training requires at least one GPU."
-    dist.init_process_group(backend='nccl', init_method='env://')
-    
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    device = rank % torch.cuda.device_count()
-    torch.cuda.set_device(device)
-    
-    seed = 42 * world_size + rank
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    np.random.seed(seed)
+
+if __name__ == "__main__":
+    # --- Setup DDP ---
+    is_ddp, rank, world_size, local_rank = setup_ddp()
+    device = f'cuda:{local_rank}' if is_ddp else CONFIG['device'] # Assign GPU
+    # Update CONFIG for clarity, though device is passed explicitly now
+    CONFIG['device'] = device
+    print(f"Rank {rank} using device: {device}")
+    # Adjust batch size for DDP: total_batch_size = batch_size_per_gpu * world_size
+    # CONFIG['total_batch_size'] = CONFIG['batch_size'] * world_size
+
+    # --- W&B Init (only on rank 0) ---
+    if rank == 0:
+        wandb.init(
+            project="simple-attention-lm-hackathon-ddp", # <-- New project name
+            config=CONFIG
+        )
+        print(f"W&B Run: {wandb.run.name}")
     
     if rank == 0:
-        print(f"World size: {world_size} GPUs")
-        print(f"Batch size per GPU: {CONFIG['batch_size']}")
-        print(f"Effective batch size: {CONFIG['batch_size'] * world_size}")
-    
-    # Check data file exists
+        print("Testing W&B log right after init...", flush=True)
+        wandb.log({"sanity_loss": 123})
+        time.sleep(5)
+    # ----------------------------------
+
     DATA_FILE = "train_dataset.bin"
     if not os.path.exists(DATA_FILE):
         if rank == 0:
             print(f"Error: {DATA_FILE} not found.")
-        cleanup()
-        sys.exit(1)
-    
-    # W&B Init (only rank 0)
-    if rank == 0:
-        try:
-            wandb.init(
-                project="simple-attention-lm-hackathon-ddp",
-                config={**CONFIG, "world_size": world_size}
-            )
-            print(f"W&B Run: {wandb.run.name}")
-        except Exception as e:
-            print(f"W&B init failed: {e}")
-    
-    # Init Tokenizer
-    if rank == 0:
-        print(f"Loading tokenizer...")
+            print("Please run build_dataset.py first to create the dataset.")
+            wandb.finish()
+        cleanup_ddp() # Clean up DDP even on error
+        exit()
+
+    # --- Init Tokenizer (all ranks need this) ---
+    if rank == 0: print(f"Loading '{CONFIG['tokenizer_name']}' tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(CONFIG['tokenizer_name'])
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    
-    # Init Data
-    if rank == 0:
-        print("Loading data...")
-    
+
+    # --- Init Data (all ranks need dataset objects) ---
+    if rank == 0: print("Loading data...")
     train_data = MmapTrainDataset(DATA_FILE, CONFIG['block_size'], train_split=0.9)
     val_data = MmapValDataset(DATA_FILE, CONFIG['block_size'], train_split=0.9)
-    
+
     if rank == 0:
+        print(f"Total sequences (approx): {(train_data.num_tokens - CONFIG['block_size'] - 1):,}")
         print(f"Train sequences: {len(train_data):,}, Val sequences: {len(val_data):,}")
-        # --- This calculation seems off, let's use len(train_loader) ---
-        # total_tokens = 1_400_000_000 
-        # effective_batch_size = CONFIG['batch_size'] * world_size
-        # steps_per_epoch = total_tokens // effective_batch_size
-        # print(f"Steps per epoch (approx): {steps_per_epoch:,}")
-        
-    # Create Samplers
-    train_sampler = DistributedSampler(
-        train_data,
-        num_replicas=world_size,
-        rank=rank,
-        shuffle=True,
-        seed=seed
-    )
-    
-    val_sampler = DistributedSampler(
-        val_data,
-        num_replicas=world_size,
-        rank=rank,
-        shuffle=False,
-        seed=seed
-    )
-    
+
+    # --- Create Sampler for DDP ---
+    train_sampler = DistributedSampler(train_data, num_replicas=world_size, rank=rank, shuffle=True) if is_ddp else None
+    # Validation sampler often not needed unless validation is huge/slow
+    val_sampler = DistributedSampler(val_data, num_replicas=world_size, rank=rank, shuffle=False) if is_ddp else None
+    # -----------------------------
+
     train_loader = DataLoader(
         train_data,
-        batch_size=CONFIG['batch_size'],
-        shuffle=False,
-        sampler=train_sampler,
-        num_workers=4,  # INCREASED for 8 GPUs
+        batch_size=CONFIG['batch_size'], # Batch size per GPU
+        # shuffle=True, <-- Sampler handles shuffling in DDP
+        sampler=train_sampler, # <-- Use sampler
+        shuffle=(train_sampler is None), # Shuffle only if not using sampler
         pin_memory=True,
-        drop_last=True,
-        prefetch_factor=4,  # Prefetch more batches
-        persistent_workers=True  # Keep workers alive
+        num_workers=4 if device.startswith('cuda') else 0
     )
-    
     val_loader = DataLoader(
         val_data,
-        batch_size=CONFIG['batch_size'],
+        batch_size=CONFIG['batch_size'], # Batch size per GPU
+        sampler=val_sampler, # <-- Use sampler for validation too (optional but safer)
         shuffle=False,
-        sampler=val_sampler,
-        num_workers=12,
         pin_memory=True,
-        drop_last=True,
-        prefetch_factor=4,
-        persistent_workers=True
+        num_workers=4 if device.startswith('cuda') else 0
     )
-    
-    if rank == 0:
-        steps_per_epoch = len(train_loader)
-        print(f"Steps per epoch (from DataLoader): {steps_per_epoch:,}")
-        
-    # Init Model
-    if rank == 0:
-        print("Initializing model...")
-    
-    model_config = {
+
+    # --- Init Model ---
+    if rank == 0: print("Initializing model...")
+    model_config = { # Recreate config dict for clarity
         "vocab_size": CONFIG['vocab_size'],
         "block_size": CONFIG['block_size'],
         "n_layer": CONFIG['n_layer'],
@@ -258,237 +238,180 @@ def main():
         "ff_hidden": CONFIG['ff_hidden'],
         "dropout": CONFIG['dropout']
     }
-    
-    model = SimpleAttentionLM(**model_config).to(device)
-    
-    if rank == 0:
-        param_count = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6
+    model = SimpleAttentionLM(**model_config).to(device) # <-- Move to assigned device
+
+    # --- Wrap Model with DDP ---
+    if is_ddp:
+        model = DDP(model, device_ids=[local_rank])
+        if rank == 0: print("Model wrapped with DDP.")
+    # ---------------------------
+
+    if rank == 0: # Only rank 0 logs W&B watch and param count
+        wandb.watch(model, log='all', log_freq=CONFIG['log_interval'])
+        # Access original model parameters if wrapped
+        param_model = model.module if is_ddp else model
+        param_count = sum(p.numel() for p in param_model.parameters() if p.requires_grad) / 1e6
         print(f"Model parameters: {param_count:.2f}M")
-    
-    # Wrap with DDP
-    model = DDP(model, device_ids=[device])
-    
-    if rank == 0:
-        try:
-            wandb.watch(model, log='all', log_freq=CONFIG['log_interval'])
-        except:
-            pass
-    
-    # Init Optimizer & Loss
-    optimizer = AdamW(
-        model.parameters(), 
-        lr=CONFIG['learning_rate'], 
-        weight_decay=0,
-        fused=True  # Fused optimizer for B200s
-    )
+        wandb.run.summary["model_parameters_M"] = param_count
+        wandb.run.summary["world_size"] = world_size
+
+    # --- Init Optimizer & Loss ---
+    # Give DDP model parameters to optimizer
+    optimizer = AdamW(model.parameters(), lr=CONFIG['learning_rate'])
     loss_fn = nn.CrossEntropyLoss()
-    
-    # Setup gradient scaler for mixed precision
-    scaler = torch.cuda.amp.GradScaler(enabled=CONFIG['use_amp'])
-    
-    # Training Loop
-    if rank == 0:
-        print("\nStarting training...")
-        print("="*70)
-    
+
+    # --- Training Loop ---
+    if rank == 0: print("Starting training...")
     model.train()
-    train_steps = 0
-    running_loss = 0
-    log_steps = 0
-    start_time = time.time()
-    
-    try:
-        for epoch in range(CONFIG['num_epochs']):
+    step = 0 # Global step counter
+    for epoch in range(CONFIG['num_epochs']):
+        if rank == 0: print(f"--- Epoch {epoch+1}/{CONFIG['num_epochs']} ---")
+        epoch_start_time = time.time()
+
+        # --- Set epoch for sampler (important for shuffling) ---
+        if is_ddp and train_sampler:
             train_sampler.set_epoch(epoch)
-            
-            if rank == 0:
-                print(f"\nEpoch {epoch+1}/{CONFIG['num_epochs']}")
-                print("-"*70)
-            
-            for batch_idx, (x, y) in enumerate(train_loader):
-                x = x.to(device, non_blocking=True)
-                y = y.to(device, non_blocking=True)
-                
-                # BF16 autocast for forward pass
-                with torch.amp.autocast('cuda', enabled=CONFIG['use_amp'], dtype=torch.bfloat16):
-                    logits, _ = model(x, past_kv_caches=None)
-                    loss = loss_fn(logits.view(-1, CONFIG['vocab_size']), y.view(-1))
-                
-                # Backward pass with gradient scaling
-                optimizer.zero_grad(set_to_none=True)
-                scaler.scale(loss).backward()
-                
-                # Unscale gradients before clipping
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                
-                # Step optimizer
-                scaler.step(optimizer)
-                scaler.update()
-                
-                # Accumulate loss
-                running_loss += loss.item()
-                log_steps += 1
-                train_steps += 1
-                
-                # Logging
-                if train_steps % CONFIG['log_interval'] == 0:
-                    torch.cuda.synchronize()
-                    end_time = time.time()
-                    steps_per_sec = log_steps / (end_time - start_time)
-                    
-                    # Reduce loss across all processes
-                    avg_loss = torch.tensor(running_loss / log_steps, device=device)
-                    dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
-                    avg_loss = avg_loss.item() / world_size
-                    
-                    if rank == 0:
-                        print(f"Step {train_steps:6d} | Loss: {avg_loss:.4f} | Steps/Sec: {steps_per_sec:.2f}", flush=True)
-                        
-                        try:
-                            wandb.log({
-                                "step": train_steps,
-                                "epoch": epoch + 1,
-                                "train_loss": avg_loss,
-                                "steps_per_sec": steps_per_sec,
-                                "learning_rate": optimizer.param_groups[0]['lr']
-                            })
-                        except:
-                            pass
-                    
-                    # Reset monitoring variables
-                    running_loss = 0
-                    log_steps = 0
-                    start_time = time.time()
-                
-                # Evaluation
-                if train_steps % CONFIG['eval_interval'] == 0 and train_steps > 0:
-                    eval_start_time = time.time()
-                    
-                    val_loss = evaluate(model, val_loader, loss_fn, device, rank)
-                    
-                    # Synchronize after evaluation
-                    dist.barrier()
-                    
-                    eval_time = time.time() - eval_start_time
-                    
-                    if rank == 0:
-                        print(f"\nValidation at Step {train_steps}")
-                        print(f"Val Loss: {val_loss:.4f} | Eval Time: {eval_time:.2f}s\n", flush=True)
-                        
-                        try:
-                            wandb.log({
-                                "step": train_steps,
-                                "epoch": epoch + 1,
-                                "val_loss": val_loss,
-                                "eval_time": eval_time
-                            })
-                        except:
-                            pass
-                    
-                    model.train()
-                    start_time = time.time()
+        # --------------------------------------------------------
 
-                # --- CHECKPOINTING MODIFICATION ---
-                if train_steps % CONFIG['checkpoint_interval'] == 0 and train_steps > 0:
-                    # Save checkpoint only on rank 0
-                    if rank == 0:
-                        try:
-                            ckpt_dir = "checkpoints"
-                            os.makedirs(ckpt_dir, exist_ok=True)
-                            # Change filename to use step
-                            ckpt_path = os.path.join(ckpt_dir, f"model_step_{train_steps}.pt")
-                            
-                            # Unwrap DDP model for saving
-                            model_to_save = model.module if hasattr(model, 'module') else model
-                            
-                            torch.save({
-                                'epoch': epoch + 1,
-                                'train_steps': train_steps,
-                                'model_state_dict': model_to_save.state_dict(),
-                                'optimizer_state_dict': optimizer.state_dict(),
-                                'scaler_state_dict': scaler.state_dict(), # Also save scaler state
-                                'config': model_config
-                            }, ckpt_path)
-                            print(f"\n[Checkpoint] Saved at step {train_steps}: {ckpt_path}\n", flush=True)
-                            
-                            try:
-                                wandb.save(ckpt_path)
-                            except:
-                                pass
-                        except Exception as e:
-                            print(f"Error saving checkpoint at step {train_steps}: {e}", flush=True)
-                # --- END MODIFICATION ---
+        for i, (x, y) in enumerate(train_loader):
+            batch_start_time = time.time()
+            x, y = x.to(device), y.to(device) # <-- Use assigned device
+
+            # DDP handles forward/backward sync automatically
+            logits, _ = model(x, past_kv_caches=None)
+            # Access vocab_size via module if DDP wrapped
+            vocab_size = model.module.vocab_size if is_ddp else model.vocab_size
+            loss = loss_fn(logits.view(-1, vocab_size), y.view(-1))
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+
+            step += 1 # Note: This step counter increments on EACH process
+
+            # Use global step based on rank 0 or average across ranks if needed
+            # For logging, using rank 0's step count is usually sufficient
+            global_step = step * world_size # Approximate global step
+
+            if step % CONFIG['log_interval'] == 0:
+                batch_time = (time.time() - batch_start_time) * 1000 # in ms
+                if rank == 0: # Only rank 0 prints logs
+                    print(f"Rank {rank} Step {step} (Global ~{global_step}) | Loss: {loss.item():.4f} | Time: {batch_time:.2f}ms")
+
+                # --- W&B Log (only rank 0) ---
+                if rank == 0:
+                    wandb.log({
+                        "step": global_step, # Log estimated global step
+                        "epoch": epoch,
+                        "train_loss": loss.item(),
+                        "batch_time_ms": batch_time,
+                        "learning_rate": optimizer.param_groups[0]['lr'] # Log LR
+                    })
+                # ------------------------------
+
+            if step % CONFIG['eval_interval'] == 0 and step > 0:
+                # --- Validation (all ranks participate, rank 0 logs) ---
+                val_loss = evaluate(model, val_loader, loss_fn, device, is_ddp)
+                if rank == 0:
+                    print(f"--- Validation ---")
+                    print(f"Rank {rank} Step {step} (Global ~{global_step}) | Val Loss: {val_loss:.4f}")
+                    print(f"--------------------")
+                    wandb.log({
+                        "step": global_step,
+                        "epoch": epoch,
+                        "val_loss": val_loss
+                    })
+                # ----------------------------------------------------
+                model.train() # Ensure model is back in training mode
             
-            # End of epoch
-            if rank == 0:
-                print(f"\nEpoch {epoch+1} complete\n")
-                
-                # --- REMOVED EPOCH CHECKPOINTING LOGIC FROM HERE ---
-        
-        if rank == 0:
-            print("\n" + "="*70)
-            print("Training completed!")
-            print("="*70)
-        
-    except KeyboardInterrupt:
-        if rank == 0:
-            print("\nTraining interrupted by user.")
-    except Exception as e:
-        print(f"[Rank {rank}] Error during training: {e}", flush=True)
-        import traceback
-        traceback.print_exc()
-    finally:
-        # Save final model (only rank 0)
-        if rank == 0:
-            try:
-                model_save_path = "simple_lm_custom_dataset_ddp.pt"
-                model_to_save = model.module if hasattr(model, 'module') else model
-                torch.save(model_to_save.state_dict(), model_save_path)
-                print(f"\nFinal model saved to {model_save_path}")
-                
-                # Test Generation
-                print("\n" + "="*70)
-                print("Testing Generation")
-                print("="*70)
-                
-                gen_model = SimpleAttentionLM(**model_config).to(device)
-                gen_model.load_state_dict(torch.load(model_save_path))
-                gen_model.eval()
-                
-                prompt = "Once upon a time there was"
-                print(f"Prompt: '{prompt}'")
-                prompt_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
-                
-                with torch.no_grad():
-                    generated_ids = gen_model.generate(
-                        prompt_ids,
-                        max_new_tokens=50,
-                        temperature=0.8,
-                        top_k=50
-                    )
-                
-                generated_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
-                print("\nGenerated Text:")
-                print("-" * 70)
-                print(generated_text)
-                print("-" * 70)
-                
-                try:
-                    generation_table = wandb.Table(columns=["step", "prompt", "generated_text"])
-                    generation_table.add_data(train_steps, prompt, generated_text)
-                    wandb.log({"generation_samples": generation_table})
-                    wandb.finish()
-                except:
-                    pass
-                
-            except Exception as e:
-                print(f"Error during final save/generation: {e}")
-        
-        # Cleanup
-        print(f"[Rank {rank}] Cleaning up...", flush=True)
-        cleanup()
+            # --- [NEW] Save checkpoint every N steps ---
+            if step % CONFIG['save_interval'] == 0 and step > 0:
+                if rank == 0: # Only rank 0 saves the checkpoint
+                    ckpt_dir = "checkpoints"
+                    os.makedirs(ckpt_dir, exist_ok=True)
+                    # Change filename to be step-based
+                    ckpt_path = os.path.join(ckpt_dir, f"model_step_{step}.pt") 
+
+                    save_model = model.module if is_ddp else model
+                    torch.save(save_model.state_dict(), ckpt_path)
+                    print(f"[Checkpoint] Saved model checkpoint -> {ckpt_path}")
+
+                    # Optionally sync with W&B
+                    wandb.save(ckpt_path)
+
+                    # Optional: limit number of checkpoints to keep (e.g., last 3)
+                    # MAX_CHECKPOINTS = 3
+                    # # Get all step checkpoints
+                    # ckpts = sorted(
+                    #     [f for f in os.listdir(ckpt_dir) if f.startswith("model_step_") and f.endswith(".pt")],
+                    #     # Sort by the step number (the integer after '_')
+                    #     key=lambda f: int(f.split('_')[-1].split('.')[0]) 
+                    # )
+                    # if len(ckpts) > MAX_CHECKPOINTS:
+                    #     old_ckpt = os.path.join(ckpt_dir, ckpts[0])
+                    #     try:
+                    #         os.remove(old_ckpt)
+                    #         print(f"[Checkpoint] Deleted old checkpoint -> {old_ckpt}")
+                    #     except OSError as e:
+                    #         print(f"[Checkpoint] Error deleting old checkpoint {old_ckpt}: {e}")
+            # --- End of [NEW] Checkpoint block ---
 
 
-if __name__ == "__main__":
-    main()
+        # --- Sync at end of epoch ---
+        if is_ddp:
+            dist.barrier() # Wait for all processes to finish epoch
+
+        epoch_time = time.time() - epoch_start_time
+        if rank == 0:
+            print(f"Epoch {epoch+1} finished in {epoch_time:.2f}s")
+            
+            # --- [MOVED] Save model checkpoint every epoch ---
+            # This logic has been moved into the step loop above.
+
+    if rank == 0: print("Training finished.")
+
+    # --- Save the final model (only rank 0) ---
+    if rank == 0:
+        # Renamed to _final to avoid conflicting with step checkpoints
+        model_save_path = "simple_lm_custom_dataset_ddp_final.pt" 
+        # Save the underlying model state dict
+        save_model = model.module if is_ddp else model
+        torch.save(save_model.state_dict(), model_save_path)
+        print(f"Final model saved to {model_save_path}")
+
+        # --- Test Generation (only rank 0) ---
+        print("\n--- Testing Generation ---")
+        # Load state dict into the *original* model structure, not the DDP wrapper
+        gen_model = SimpleAttentionLM(**model_config).to(device)
+        gen_model.load_state_dict(torch.load(model_save_path))
+        gen_model.eval() # Set to eval mode for generation
+
+        prompt = "Once upon a time there was"
+        print(f"Prompt: '{prompt}'")
+        prompt_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
+
+        with torch.no_grad(): # Ensure no gradients are computed
+             generated_ids = gen_model.generate(
+                prompt_ids,
+                max_new_tokens=50,
+                temperature=0.8,
+                top_k=50
+            )
+
+        generated_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+        print("\n--- Generated Text ---")
+        print(generated_text)
+
+        # --- W&B Log Generation ---
+        generation_table = wandb.Table(columns=["step", "prompt", "generated_text"])
+        generation_table.add_data(global_step, prompt, generated_text)
+        wandb.log({"generation_samples": generation_table})
+
+        # --- W&B Finish ---
+        wandb.finish()
+        print("W&B run finished.")
+    # ----------------------------------------
+
+    # --- Cleanup DDP ---
+    cleanup_ddp()
+    # ------------------

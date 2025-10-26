@@ -126,7 +126,8 @@ class Pruner:
             # find the k-th smallest magnitude -> threshold
             # We want to PRUNE k elements, so we KEEP (numel - k) elements.
             # The threshold should be the k-th smallest value.
-            thresh = torch.kthvalue(all_scores, k).values
+            # thresh = torch.kthvalue(all_scores, k).values
+            thresh = torch.kthvalue(all_scores.cpu(), k).values.to(all_scores.device)
 
         masks = {}
         for name, score in scores.items():
@@ -615,3 +616,241 @@ if __name__ == "__main__":
 
     nonzero_after, total = count_nonzero(model_stoch)
     print(f"After stochastic prune (k=10/10): nonzero={nonzero_after}/{total} ({nonzero_after/total*100:.2f}%)")
+
+# Add the following to the same file containing Pruner / StochasticPruner
+
+import math
+from typing import Tuple, Optional
+
+class PrunerWithSVD(Pruner):
+    """
+    Extends Pruner with methods to convert pruned weight matrices to low-rank
+    approximations (via SVD). Two behaviors:
+      - factorize (preferred for Linear): replace nn.Linear with two smaller linears.
+      - reconstruct_dense: compute low-rank reconstruction and write it back to param.data.
+    """
+
+    def __init__(self, model: nn.Module, device: Optional[torch.device] = None):
+        super().__init__(model, device)
+        # build a mapping full_param_name -> (module, param_name_in_module, param)
+        self._build_name_map()
+
+    def _build_name_map(self):
+        """Populate a lookup map from full param-names -> (module, param_name, param)."""
+        self._name_map = {}
+        for module_name, module in self.model.named_modules():
+            for name, param in list(module.named_parameters(recurse=False)):
+                full_name = f"{module_name}.{name}" if module_name else name
+                self._name_map[full_name] = (module, name, param)
+
+    def _get_module_by_name(self, module_name: str) -> nn.Module:
+        """Return module object by dotted name ('' -> root/self.model)."""
+        if module_name == "" or module_name is None:
+            return self.model
+        parts = module_name.split(".")
+        cur = self.model
+        for p in parts:
+            cur = getattr(cur, p)
+        return cur
+
+    def _solve_rank_for_budget(self, kept_count: int, m: int, n: int, min_rank: int = 1) -> int:
+        """
+        Solve for k such that k*(m + n) ~= kept_count.
+        Return at least min_rank and at most min(m, n).
+        """
+        if kept_count <= 0:
+            return 0
+        k = math.ceil(kept_count / (m + n))
+        k = max(min_rank, k)
+        k = min(k, min(m, n))
+        return k
+
+    def _svd_decompose(self, W, k=None, device=None):
+        # Move to CPU if not already
+        W_cpu = W.to("cpu")
+        
+        # Convert to float32 if it’s half precision
+        if W_cpu.dtype == torch.float16:
+            W_cpu = W_cpu.float()
+
+        # Perform SVD
+        try:
+            U, S, Vh = torch.linalg.svd(W_cpu, full_matrices=False)
+        except Exception:
+            # fallback to old API
+            U, S, Vh = torch.svd(W_cpu)
+        
+        if k is not None:
+            U = U[:, :k]
+            S = S[:k]
+            Vh = Vh[:k, :]
+        
+        return U, S, Vh
+
+
+    def apply_svd_on_masks(
+        self,
+        masks: Optional[Dict[str, torch.Tensor]] = None,
+        mode: str = "factorize",           # "factorize" | "reconstruct_dense"
+        min_rank: int = 1,
+        svd_device: Optional[torch.device] = None,
+        inplace: bool = True
+    ):
+        """
+        Convert pruned parameters (given by masks) into low-rank approximations.
+
+        - masks: dict mapping full param name -> boolean keep-mask. If None, will use self.masks.
+        - mode:
+          - "factorize": for nn.Linear layers, replace them with two smaller Linears
+                         so parameter count becomes ~k*(m+n). For convs: fall back to reconstruct.
+          - "reconstruct_dense": compute low-rank reconstruction and assign param.data = W_lowrank.
+        - svd_device: device to run SVD on (usually "cpu" to save GPU memory). If None, runs on CPU.
+        - inplace: if True, perform replacements/assignments.
+        """
+        if masks is None:
+            masks = self.masks
+        if not masks:
+            print("No masks provided/loaded. Nothing to do.")
+            return
+
+        # Ensure name map is current
+        self._build_name_map()
+
+        for full_name, mask in masks.items():
+            if full_name not in self._name_map:
+                print(f"Warning: {full_name} not found in model; skipping SVD for it.")
+                continue
+
+            module, param_name, param = self._name_map[full_name]
+            W = param.data.detach()
+            # handle conv kernels by flattening
+            is_conv = (W.ndim == 4)  # (out, in, kh, kw)
+            if is_conv:
+                out_ch, in_ch, kh, kw = W.shape
+                W_mat = W.view(out_ch, -1)  # (out, in*kh*kw)
+                m, n = W_mat.shape
+                kept = int(mask.to(torch.int).sum().item())
+                k = self._solve_rank_for_budget(kept, m, n, min_rank=min_rank)
+                if k <= 0:
+                    print(f"  {full_name}: no kept elements -> skipping")
+                    continue
+                # compute SVD (prefer CPU)
+                U_k, S_k, Vt_k = self._svd_decompose(W_mat, k, device=svd_device)
+                # reconstruct dense low-rank
+                # W_low = U_k @ diag(S_k) @ Vt_k
+                W_low = (U_k * S_k.unsqueeze(0)) @ Vt_k
+                W_low = W_low.view_as(W)
+                if mode == "reconstruct_dense" and inplace:
+                    with torch.no_grad():
+                        param.data.copy_(W_low.to(param.device))
+                    print(f"  {full_name}: conv reconstructed as dense low-rank k={k}")
+                else:
+                    # factorizing convs into efficient convs is not implemented here
+                    # fallback to dense reconstruction
+                    with torch.no_grad():
+                        param.data.copy_(W_low.to(param.device))
+                    print(f"  {full_name}: conv fallback reconstructed as dense low-rank k={k}")
+                continue
+
+            # for Linear-like weights (2D) or other 2D params:
+            if W.ndim != 2:
+                # If not 2D, try flattening to (out, -1)
+                W_mat = W.view(W.shape[0], -1)
+            else:
+                W_mat = W
+
+            m, n = W_mat.shape
+            kept = int(mask.to(torch.int).sum().item())
+            k = self._solve_rank_for_budget(kept, m, n, min_rank=min_rank)
+            if k <= 0:
+                print(f"  {full_name}: no kept elements -> skipping")
+                continue
+
+            U_k, S_k, Vt_k = self._svd_decompose(W_mat, k, device=svd_device)
+
+            if mode == "reconstruct_dense":
+                # Reconstruct and write back into param
+                W_low = (U_k * S_k.unsqueeze(0)) @ Vt_k
+                W_low = W_low.view_as(param.data)
+                if inplace:
+                    with torch.no_grad():
+                        param.data.copy_(W_low.to(param.device))
+                print(f"  {full_name}: reconstructed dense low-rank k={k}")
+                continue
+
+            # mode == "factorize"
+            # Only attempt factorization for nn.Linear modules (most straightforward)
+            if isinstance(module, nn.Linear) and param_name == "weight":
+                # W shape is (out, in)
+                out, inp = m, n
+                # create two linear layers: first maps inp -> k (no bias), second maps k -> out (bias)
+                first = nn.Linear(inp, k, bias=False)
+                second = nn.Linear(k, out, bias=True)
+
+                # Set weights: first.weight <- Vt_k (k, inp)
+                # second.weight <- (U_k * S_k.unsqueeze(0)) (out, k)
+                with torch.no_grad():
+                    first.weight.copy_(Vt_k.to(first.weight.device))
+                    second.weight.copy_((U_k * S_k.unsqueeze(0)).to(second.weight.device))
+                    # transfer bias if original module had bias
+                    if hasattr(module, "bias") and module.bias is not None:
+                        second.bias.copy_(module.bias.data.to(second.bias.device))
+                    else:
+                        # ensure zero bias
+                        second.bias.zero_()
+
+                # Build a sequential to replace the original linear:
+                # x -> first(x) -> second(x)
+                new_seq = nn.Sequential(first, second)
+
+                # Replace the module in the parent with new_seq
+                # Need to find parent module to set attribute
+                # module_name can be found by scanning named_modules to match `module` object
+                parent_name = None
+                child_attr = None
+                for mod_name, mod in self.model.named_modules():
+                    if mod is module:
+                        # mod_name is the name of the module itself (we want its parent)
+                        parts = mod_name.split(".") if mod_name else []
+                        if parts:
+                            parent_name = ".".join(parts[:-1])
+                            child_attr = parts[-1]
+                        else:
+                            # root module is the module itself; cannot replace root's attribute
+                            parent_name = ""
+                            child_attr = None
+                        break
+
+                if child_attr is None:
+                    # attempt fallback: find attribute on model that references this module
+                    found = False
+                    for name, mod in self.model.named_children():
+                        if mod is module:
+                            parent_name = ""
+                            child_attr = name
+                            found = True
+                            break
+                    if not found:
+                        # last resort: can't replace safely, do dense reconstruction instead
+                        W_low = (U_k * S_k.unsqueeze(0)) @ Vt_k
+                        with torch.no_grad():
+                            param.data.copy_(W_low.view_as(param.data).to(param.device))
+                        print(f"  {full_name}: could not replace Linear module, wrote dense instead (k={k})")
+                        continue
+
+                parent = self._get_module_by_name(parent_name)
+                # set attribute
+                setattr(parent, child_attr, new_seq)
+                print(f"  {full_name}: replaced nn.Linear '{parent_name + '.' if parent_name else ''}{child_attr}' with factorized rank-{k} pair (params ~ {k*(m+n):,})")
+                # After replacement, rebuild the name map
+                self._build_name_map()
+            else:
+                # fallback: reconstruct dense
+                W_low = (U_k * S_k.unsqueeze(0)) @ Vt_k
+                W_low = W_low.view_as(param.data)
+                if inplace:
+                    with torch.no_grad():
+                        param.data.copy_(W_low.to(param.device))
+                print(f"  {full_name}: non-Linear or unsupported module -> reconstructed dense low-rank k={k}")
+
+        print("SVD conversion done.")
