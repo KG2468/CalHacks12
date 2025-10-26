@@ -190,7 +190,7 @@ def train_epoch(small_model, large_model, large_tokenizer, train_loader, optimiz
     total_loss = 0.0
     num_batches = 0
     print("BATCH_SIZE: ", BATCH_SIZE)
-    for batch_idx, batch in enumerate(train_loader):
+    for batch_idx, batch in enumerate(train_loader()):
         for i in range(BATCH_SIZE):
             print("batch_idx: ", batch_idx)
             print("BATCH_SIZE: ", BATCH_SIZE)
@@ -438,6 +438,11 @@ def train_epoch(small_model, large_model, large_tokenizer, train_loader, optimiz
         
     return total_loss / max(num_batches, 1)
 
+def train_loader(dataset, batch_size):
+    #generate batchsize random indices
+    indices = torch.randint(0, len(dataset), (batch_size,))
+    return [dataset.__getitem__(i) for i in indices]
+
 # --- 5. Main ---
 def main(args):
     print(f"Using device: {DEVICE}")
@@ -455,7 +460,7 @@ def main(args):
     # Load dataset
     print("Loading dataset...")
     dataset = StructuredCoTDataset(args.data_file, tokenizer, custom_sys_prompt=CUSTOM_SYS_PROMPT)
-    train_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+    train_loader =lambda : train_loader(dataset, BATCH_SIZE)
     
     # Initialize small model (the one we're training)
     print("Initializing small model...")
