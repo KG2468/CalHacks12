@@ -340,20 +340,20 @@ if __name__ == "__main__":
                     wandb.save(ckpt_path)
 
                     # Optional: limit number of checkpoints to keep (e.g., last 3)
-                    MAX_CHECKPOINTS = 3
-                    # Get all step checkpoints
-                    ckpts = sorted(
-                        [f for f in os.listdir(ckpt_dir) if f.startswith("model_step_") and f.endswith(".pt")],
-                        # Sort by the step number (the integer after '_')
-                        key=lambda f: int(f.split('_')[-1].split('.')[0]) 
-                    )
-                    if len(ckpts) > MAX_CHECKPOINTS:
-                        old_ckpt = os.path.join(ckpt_dir, ckpts[0])
-                        try:
-                            os.remove(old_ckpt)
-                            print(f"[Checkpoint] Deleted old checkpoint -> {old_ckpt}")
-                        except OSError as e:
-                            print(f"[Checkpoint] Error deleting old checkpoint {old_ckpt}: {e}")
+                    # MAX_CHECKPOINTS = 3
+                    # # Get all step checkpoints
+                    # ckpts = sorted(
+                    #     [f for f in os.listdir(ckpt_dir) if f.startswith("model_step_") and f.endswith(".pt")],
+                    #     # Sort by the step number (the integer after '_')
+                    #     key=lambda f: int(f.split('_')[-1].split('.')[0]) 
+                    # )
+                    # if len(ckpts) > MAX_CHECKPOINTS:
+                    #     old_ckpt = os.path.join(ckpt_dir, ckpts[0])
+                    #     try:
+                    #         os.remove(old_ckpt)
+                    #         print(f"[Checkpoint] Deleted old checkpoint -> {old_ckpt}")
+                    #     except OSError as e:
+                    #         print(f"[Checkpoint] Error deleting old checkpoint {old_ckpt}: {e}")
             # --- End of [NEW] Checkpoint block ---
 
 

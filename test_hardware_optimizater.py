@@ -34,6 +34,8 @@ MODEL_NAME = "google/gemma-3-270m"
 MAX_LENGTH = 128
 LLM_BENCHMARK_PROMPT = "The capital of France is"
 
+PRUNED_SVD_PATH = "gemma_pruned_svd_final.pth"
+
 # Global Tokenizer (required for all data operations)
 GLOBAL_TOKENIZER = AutoTokenizer.from_pretrained(MODEL_NAME)
 # Set padding token to EOS token ID for generation compatibility
@@ -73,6 +75,8 @@ def load_gemma_model(precision: torch.dtype, device: torch.device) -> AutoModelF
     # Ensure model is in evaluation mode for inference testing
     model.eval()
     return model
+
+
 
 # ==============================================================================
 # II. Testing and Benchmarking Utilities (LLM Metrics)
@@ -193,7 +197,24 @@ if __name__ == "__main__":
     
     # --- Setup ---
     # Target CUDA if available for LLM acceleration
-    TARGET_DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # TARGET_DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # if torch.cuda.is_available():
+    #     TARGET_DEVICE = torch.device('cuda')
+    # elif torch.backends.mps.is_available():
+    #     TARGET_DEVICE = torch.device('mps')
+    # else:
+    TARGET_DEVICE = torch.device('cpu')
+    
+    # Determine optimal dtype
+    if TARGET_DEVICE.type == 'cuda':
+        major, _ = torch.cuda.get_device_capability()
+        TARGET_DTYPE = torch.bfloat16 if major >= 8 else torch.float16
+    elif TARGET_DEVICE.type == 'mps':
+        # MPS supports float16 well
+        TARGET_DTYPE = torch.float16
+    else:
+        # CPU must use float32
+        TARGET_DTYPE = torch.float32
     
     # Determine optimal dtype for GPU
     if TARGET_DEVICE.type == 'cuda':
@@ -212,6 +233,12 @@ if __name__ == "__main__":
     # Load FP32 model, then cast to the optimal mixed precision dtype (BF16/FP16)
     # This is the effective baseline for modern GPU testing.
     fp32_model = load_gemma_model(torch.float32, TARGET_DEVICE).to(TARGET_DTYPE) 
+
+    # print(f"\n[0] Loading Pruned+SVD model weights from {PRUNED_SVD_PATH}...")
+    # svd_model = load_gemma_model(TARGET_DTYPE, TARGET_DEVICE)  # same dtype/device as test
+    # svd_model.load_state_dict(torch.load(PRUNED_SVD_PATH, map_location=TARGET_DEVICE))
+    # svd_model.eval()
+    # print("✅ Pruned + SVD model loaded successfully.")
     
     # Create DataLoaders
     CALIB_LOADER = DataLoader(MockLLMDataset(GLOBAL_TOKENIZER, size=10), batch_size=2)
@@ -245,14 +272,18 @@ if __name__ == "__main__":
     # --- 3. Measurement ---
     print("\n[3/4] Measuring Performance...")
 
+    print("right before baseline measurements")
     # Baseline Measurements
     fp32_size = get_model_size_mb(fp32_model)
     fp32_ppl = evaluate_perplexity(fp32_model, TEST_LOADER, TARGET_DEVICE)
     fp32_tps = benchmark_generation_speed(fp32_model, LLM_BENCHMARK_PROMPT, GLOBAL_TOKENIZER, TARGET_DEVICE)
     
+    print("right before optimized measurements")
     # Optimized Measurements
     optimized_size = get_model_size_mb(optimized_model)
+    print("right before optimized perplexity")
     optimized_ppl = evaluate_perplexity(optimized_model, TEST_LOADER, TARGET_DEVICE)
+    print("right before optimized tps")
     optimized_tps = benchmark_generation_speed(optimized_model, LLM_BENCHMARK_PROMPT, GLOBAL_TOKENIZER, TARGET_DEVICE)
 
 
@@ -276,3 +307,9 @@ if __name__ == "__main__":
     print(f"| Perplexity (PPL) | {fp32_ppl:.3f} | {optimized_ppl:.3f} | {ppl_change:.3f} (Lower is better) |")
     print(f"| Tokens/Second (TPS) | {fp32_tps:.2f} | {optimized_tps:.2f} | {speedup:.2f}x Speedup |")
     print("-" * 70)
+
+    OUTPUT_PATH = "gemma_quantized_final.pth"
+
+    # Save the model's state_dict (weights) to a file
+    torch.save(optimized_model.state_dict(), OUTPUT_PATH)
+    print(f"\n✅ Pruned + Quantized model saved to: {OUTPUT_PATH}")
