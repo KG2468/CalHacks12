@@ -28,6 +28,7 @@ except ImportError:
 # ==============================================================================
 
 # MODEL_NAME = "google/gemma-3-270m" # Removed hardcoded name
+MODEL_NAME = "Qwen/Qwen3-8B"
 MAX_LENGTH = 128
 LLM_BENCHMARK_PROMPT = "The capital of France is"
 
@@ -60,7 +61,7 @@ class MockLLMDataset(Dataset):
 def load_model(model_name: str, precision: torch.dtype, device: torch.device) -> AutoModelForCausalLM:
     """Loads the specified model in the specified precision and maps it to the device."""
     model = AutoModelForCausalLM.from_pretrained(
-        model_name, # Use argument
+        MODEL_NAME, # Use argument
         torch_dtype=precision, 
         device_map=device,      
         low_cpu_mem_usage=True
